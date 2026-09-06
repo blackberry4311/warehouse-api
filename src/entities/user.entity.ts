@@ -20,6 +20,10 @@ export class User {
   @Column({ type: 'varchar', nullable: true, name: 'display_name' })
   displayName: string;
 
+  /** System super-admin: bypasses all permission checks (see PermissionsGuard). */
+  @Column({ type: 'boolean', name: 'is_admin', default: false })
+  isAdmin: boolean;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt: Date;
 

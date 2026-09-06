@@ -5,7 +5,14 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { User } from './entities/user.entity';
 import { RefreshToken } from './entities/refresh-token.entity';
+import { Organization } from './entities/organization.entity';
+import { UserOrg } from './entities/user-org.entity';
+import { OrgGroup } from './entities/org-group.entity';
+import { Permission } from './entities/permission.entity';
+import { UserGroup } from './entities/user-group.entity';
+import { GroupPermission } from './entities/group-permission.entity';
 import { AuthModule } from './auth/auth.module';
+import { OrganizationModule } from './organization/organization.module';
 
 @Module({
   imports: [
@@ -16,12 +23,22 @@ import { AuthModule } from './auth/auth.module';
         type: 'postgres',
         url: config.get('DATABASE_URL'),
         schema: 'wh',
-        entities: [User, RefreshToken],
+        entities: [
+          User,
+          RefreshToken,
+          Organization,
+          UserOrg,
+          OrgGroup,
+          Permission,
+          UserGroup,
+          GroupPermission,
+        ],
         synchronize: false,
       }),
     }),
     TypeOrmModule.forFeature([User, RefreshToken]),
     AuthModule,
+    OrganizationModule,
   ],
   exports: [TypeOrmModule],
   controllers: [AppController],

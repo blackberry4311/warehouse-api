@@ -1,7 +1,6 @@
 import { Body, Controller, HttpCode, HttpStatus, Post, Req, UseGuards } from '@nestjs/common';
 import { Request } from 'express';
 import { AuthService } from './auth.service';
-import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
 
@@ -9,11 +8,11 @@ import { JwtRefreshGuard } from './guards/jwt-refresh.guard';
 export class AuthController {
   constructor(private authService: AuthService) {}
 
-  @Post('register')
-  @HttpCode(HttpStatus.OK)
-  register(@Body() dto: RegisterDto) {
-    return this.authService.register(dto);
-  }
+  // @Post('register')
+  // @HttpCode(HttpStatus.OK)
+  // register(@Body() dto: RegisterDto) {
+  //   return this.authService.register(dto);
+  // }
 
   @Post('login')
   @HttpCode(HttpStatus.OK)
