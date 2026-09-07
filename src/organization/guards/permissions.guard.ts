@@ -41,7 +41,7 @@ export class PermissionsGuard implements CanActivate {
     const required = API_PERMISSION_MAP[key];
 
     // Not listed => public route.
-    if (!required) return true;
+    if (!required || required.length === 0) return true;
 
     const authUser = this.authenticate(request);
     (request as FastifyRequest & { user: AuthenticatedUser }).user = authUser;
@@ -52,9 +52,10 @@ export class PermissionsGuard implements CanActivate {
     // System super-admin bypasses all permission checks.
     if (user.isAdmin) return true;
 
+    // A route may be granted by several permissions; holding any one suffices.
     const held = await this.orgService.getEffectivePermissionNames(user.id);
-    if (!held.has(required)) {
-      throw new ForbiddenException(`Missing required permission: ${required}`);
+    if (!required.some((permission) => held.has(permission))) {
+      throw new ForbiddenException(`Missing required permission: ${required.join(' or ')}`);
     }
 
     return true;

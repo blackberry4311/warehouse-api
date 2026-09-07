@@ -18,6 +18,7 @@ import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
 import { CreatePermissionDto } from './dto/create-permission.dto';
 import { CreateUserDto } from './dto/create-user.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
 
 /**
  * Manages everything under an organization: membership, groups (roles),
@@ -319,11 +320,13 @@ export class OrganizationService {
     if (existing) throw new ConflictException('Email already registered');
 
     const passwordHash = await bcrypt.hash(dto.password, 10);
+    const code = await this.resolveUserCode(dto.code, dto.displayName ?? dto.email);
     const user = await this.userRepo.save(
       this.userRepo.create({
         email: dto.email,
         passwordHash,
         displayName: dto.displayName ?? dto.email,
+        code,
       }),
     );
 
@@ -335,9 +338,78 @@ export class OrganizationService {
     return { id: user.id, email: user.email };
   }
 
+  async updateUser(actingUserId: string, targetUserId: string, dto: UpdateUserDto) {
+    const actor = await this.ensureUserExists(actingUserId);
+    const target = await this.ensureUserExists(targetUserId);
+
+    if (!actor.isAdmin) {
+      const [actorOrgs, targetOrgs] = await Promise.all([
+        this.userOrgRepo.find({ where: { userId: actingUserId }, select: { orgId: true } }),
+        this.userOrgRepo.find({ where: { userId: targetUserId }, select: { orgId: true } }),
+      ]);
+      const targetOrgIds = new Set(targetOrgs.map((m) => m.orgId));
+      const sharesOrg = actorOrgs.some((m) => targetOrgIds.has(m.orgId));
+      if (!sharesOrg) {
+        throw new ForbiddenException('You do not share an organization with this user');
+      }
+    }
+
+    if (dto.displayName !== undefined) target.displayName = dto.displayName;
+    if (dto.password !== undefined) target.passwordHash = await bcrypt.hash(dto.password, 10);
+
+    const saved = await this.userRepo.save(target);
+    return { id: saved.id, email: saved.email, displayName: saved.displayName };
+  }
+
   private async ensureUserExists(userId: string) {
     const user = await this.userRepo.findOne({ where: { id: userId } });
     if (!user) throw new NotFoundException('User not found');
     return user;
+  }
+
+  /** Throw unless the user belongs to `orgId` (system admins bypass). */
+  async assertOrgMembership(orgId: string, userId: string): Promise<void> {
+    const user = await this.ensureUserExists(userId);
+    if (user.isAdmin) return;
+    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId } });
+    if (!membership) throw new ForbiddenException('You do not belong to this organization');
+  }
+
+  /**
+   * Whether the user effectively holds `permissionName` within `orgId`. System
+   * admins always do. Used for row-level scoping (e.g. `manage_order` staff see
+   * every order in the org, while a plain `place_order` client sees only theirs).
+   */
+  async hasOrgPermission(orgId: string, userId: string, permissionName: string): Promise<boolean> {
+    const user = await this.ensureUserExists(userId);
+    if (user.isAdmin) return true;
+    const permissions = await this.getUserPermissions(orgId, userId);
+    return permissions.some((p) => p.name === permissionName);
+  }
+
+  /**
+   * Resolve a unique client `code`. Uses `requested` if it is still free;
+   * otherwise derives a base from `fallbackSource` (uppercase alphanumerics)
+   * and appends a numeric suffix until free. The unique index is the backstop.
+   */
+  async resolveUserCode(requested: string | undefined, fallbackSource: string): Promise<string> {
+    if (requested) {
+      const existing = await this.userRepo.findOne({ where: { code: requested } });
+      if (existing) throw new ConflictException('Client code already in use');
+      return requested;
+    }
+
+    const base = this.deriveCodeBase(fallbackSource);
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const candidate = (attempt === 0 ? base : `${base}${attempt + 1}`).slice(0, 16);
+      const existing = await this.userRepo.findOne({ where: { code: candidate } });
+      if (!existing) return candidate;
+    }
+    return `${base}${Date.now().toString(36).toUpperCase()}`.slice(0, 16);
+  }
+
+  private deriveCodeBase(source: string): string {
+    const cleaned = (source ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    return cleaned.slice(0, 12) || 'CLIENT';
   }
 }

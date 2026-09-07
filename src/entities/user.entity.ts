@@ -24,6 +24,10 @@ export class User {
   @Column({ type: 'boolean', name: 'is_admin', default: false })
   isAdmin: boolean;
 
+  /** Per-user client code used to build order numbers (e.g. ACME-000123). */
+  @Column({ type: 'varchar', length: 16, nullable: true })
+  code: string | null;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
   createdAt: Date;
 

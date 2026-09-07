@@ -5,6 +5,7 @@ import {
   Get,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   UseGuards,
 } from '@nestjs/common';
@@ -19,6 +20,7 @@ import { AssignGroupDto } from './dto/assign-group.dto';
 import { CreatePermissionDto } from './dto/create-permission.dto';
 import { AssignPermissionDto } from './dto/assign-permission.dto';
 import { CreateUserDto } from './dto/create-user.dto';
+import { UpdateUserDto } from './dto/update-user.dto';
 
 // Access control is enforced globally by PermissionsGuard via API_PERMISSION_MAP
 // (see src/auth/permissions.config.ts) — no per-route guards/decorators here.
@@ -33,9 +35,16 @@ export class OrganizationController {
     return this.orgService.createUser(actor.userId, dto);
   }
 
-  // The caller's own access tree (orgs -> groups -> permissions). Authenticated
-  // only — no specific permission — so it uses JwtAccessGuard directly rather
-  // than the map. Declared before ':orgId' so the static path wins.
+  // Edit everything on a user except their email (see UpdateUserDto).
+  @Patch('users/:userId')
+  updateUser(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Body() dto: UpdateUserDto,
+  ) {
+    return this.orgService.updateUser(actor.userId, userId, dto);
+  }
+
   @Get('me')
   @UseGuards(JwtAccessGuard)
   getMyAccess(@CurrentUser() user: AuthenticatedUser) {
