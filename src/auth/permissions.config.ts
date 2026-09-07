@@ -15,12 +15,14 @@ export const API_PERMISSION_MAP: Record<string, string> = {
   'post /organizations': 'manage_organizations',
   'get /organizations': 'view_organizations',
   'get /organizations/:orgId': 'view_organizations',
+  'delete /organizations/:orgId': 'manage_organizations',
 
   // Members
   'post /organizations/:orgId/members': 'manage_org_members',
   'get /organizations/:orgId/members': 'view_org_members',
   'delete /organizations/:orgId/members/:userId': 'manage_org_members',
   'get /organizations/:orgId/members/:userId/permissions': 'view_user_permissions',
+  'get /organizations/:orgId/members/:userId/groups': 'manage_group_members',
 
   // Groups
   'post /organizations/:orgId/groups': 'manage_groups',

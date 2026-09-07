@@ -66,13 +66,12 @@ create index org_groups_org_id_idx on wh.org_groups (org_id_fk);
 
 create table wh.permissions
 (
-    id          uuid                     default gen_random_uuid() not null
-        primary key,
-    name        varchar(255)                                       not null,
-    description text                                               not null,
-    created_at  timestamp with time zone default now()             not null,
-    updated_at  timestamp with time zone
+    id           uuid primary key       not null default gen_random_uuid(),
+    name         character varying(255) not null,
+    description  text                   not null,
+    is_group_lvl boolean                not null default false
 );
+create unique index permission_unique on wh.permissions using btree (name);
 
 create unique index permission_unique on wh.permissions (name);
 
@@ -100,18 +99,29 @@ create table wh.group_permissions
 
 create index group_permissions_permission_id_idx on wh.group_permissions (permission_id_fk);
 
-insert into wh.permissions (name, description)
-values ('add_user', 'Create a user and attach them to an organization'),
-       ('manage_organizations', 'Create organizations'),
-       ('view_organizations', 'List and view organizations'),
-       ('manage_org_members', 'Add or remove organization members'),
-       ('view_org_members', 'List organization members'),
-       ('view_user_permissions', 'View a user''s effective permissions'),
-       ('manage_groups', 'Create or delete groups within an organization'),
-       ('view_groups', 'List groups within an organization'),
-       ('manage_group_members', 'Assign or remove users from groups'),
-       ('manage_group_permissions', 'Grant or revoke a group permissions'),
-       ('view_group_permissions', 'List a group''s permissions'),
-       ('manage_permissions', 'Create entries in the permission catalog'),
-       ('view_permissions', 'List the permission catalog')
-on conflict (name) do nothing;
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Create organizations', 'manage_organizations', false);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('List and view organizations', 'view_organizations', false);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Create entries in the permission catalog', 'manage_permissions', false);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Create a user and attach them to an organization', 'add_user', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('View a user''s effective permissions', 'view_user_permissions', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Grant or revoke a group permissions', 'manage_group_permissions', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Assign or remove users from groups', 'manage_group_members', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('List organization members', 'view_org_members', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Create or delete groups within an organization', 'manage_groups', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('List groups within an organization', 'view_groups', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('Add or remove organization members', 'manage_org_members', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('List the permission catalog', 'view_permissions', true);
+INSERT INTO wh.permissions (description, name, is_group_lvl)
+VALUES ('List a group''s permissions', 'view_group_permissions', true);

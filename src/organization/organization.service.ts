@@ -53,6 +53,14 @@ export class OrganizationService {
     return org;
   }
 
+  async deleteOrganization(orgId: string) {
+    await this.getOrganization(orgId);
+    // FKs cascade on delete (users_orgs, org_groups → group_permissions,
+    // user_groups), so removing the org removes its membership and group wiring.
+    await this.orgRepo.delete({ id: orgId });
+    return { deleted: true };
+  }
+
   // --- Membership ----------------------------------------------------------
 
   async addMember(orgId: string, userId: string) {
@@ -127,6 +135,20 @@ export class OrganizationService {
     return { removed: true };
   }
 
+  async listUserGroups(orgId: string, userId: string): Promise<OrgGroup[]> {
+    const orgGroups = await this.groupRepo.find({ where: { orgId }, select: { id: true } });
+    const orgGroupIds = orgGroups.map((g) => g.id);
+    if (orgGroupIds.length === 0) return [];
+
+    const userGroups = await this.userGroupRepo.find({
+      where: { userId, groupId: In(orgGroupIds) },
+    });
+    const groupIds = userGroups.map((ug) => ug.groupId);
+    if (groupIds.length === 0) return [];
+
+    return this.groupRepo.find({ where: { id: In(groupIds) }, order: { createdAt: 'DESC' } });
+  }
+
   // --- Permissions (global catalog) ---------------------------------------
 
   async createPermission(dto: CreatePermissionDto) {
@@ -138,7 +160,7 @@ export class OrganizationService {
   }
 
   listPermissions() {
-    return this.permissionRepo.find({ order: { name: 'ASC' } });
+    return this.permissionRepo.find({ where: { isGroupPermission: true }, order: { name: 'ASC' } });
   }
 
   // --- Group <-> permission grants ----------------------------------------

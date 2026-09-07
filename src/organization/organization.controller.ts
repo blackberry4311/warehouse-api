@@ -59,6 +59,11 @@ export class OrganizationController {
     return this.orgService.getOrganization(orgId);
   }
 
+  @Delete(':orgId')
+  deleteOrganization(@Param('orgId', ParseUUIDPipe) orgId: string) {
+    return this.orgService.deleteOrganization(orgId);
+  }
+
   // --- Membership ----------------------------------------------------------
 
   @Post(':orgId/members')
@@ -85,6 +90,14 @@ export class OrganizationController {
     @Param('userId', ParseUUIDPipe) userId: string,
   ) {
     return this.orgService.getUserPermissions(orgId, userId);
+  }
+
+  @Get(':orgId/members/:userId/groups')
+  listUserGroups(
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+  ) {
+    return this.orgService.listUserGroups(orgId, userId);
   }
 
   // --- Groups (roles) ------------------------------------------------------
