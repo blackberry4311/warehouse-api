@@ -12,6 +12,8 @@ import { Permission } from '../entities/permission.entity';
 import { UserGroup } from '../entities/user-group.entity';
 import { GroupPermission } from '../entities/group-permission.entity';
 import { User } from '../entities/user.entity';
+import { OrgFee } from '../entities/org-fee.entity';
+import { CreditHistory } from '../entities/credit-history.entity';
 
 @Module({
   imports: [
@@ -24,6 +26,8 @@ import { User } from '../entities/user.entity';
       UserGroup,
       GroupPermission,
       User,
+      OrgFee,
+      CreditHistory,
     ]),
   ],
   controllers: [OrganizationController],

@@ -5,28 +5,36 @@
  * of routes it grants access to, expressed as `"<method> <route path>"` (lowercase
  * method, Nest/Fastify route pattern). One permission can gate many routes, and a
  * single route may be granted by more than one permission (the caller needs any
- * one of them) — e.g. the order read routes below are reachable by both the client
- * who placed orders (`place_order`) and operations staff (`manage_order`).
+ * one of them) — e.g. the order read routes below are reachable by the client who
+ * placed orders (`place_order`), a reviewer (`review_order`), and operations staff
+ * (`manage_order`).
  *
  * Any route NOT listed here is public. Edit this map to change access — no
  * decorators or redeploy of route code needed.
  *
- * Note: this only gates *reachability* of a route. Row-level scoping (e.g. a
- * `place_order` client only sees their own orders, while `manage_order` staff see
- * every order in the org) is enforced in `OrderService`, not here.
+ * Note: this only gates *reachability* of a route. Row-level scoping (a
+ * `place_order` client sees only their own orders, `review_order` sees all, and
+ * `manage_order` sees only locked orders) and the lock-gated split of the shared
+ * PATCH routes are enforced in `OrderService`, not here.
  */
 export const PERMISSION_API_MAP: Record<string, string[]> = {
   // Users
   add_user: ['post /organizations/users', 'patch /organizations/users/:userId'],
 
   // Organizations
-  manage_organizations: ['post /organizations', 'delete /organizations/:orgId'],
+  manage_organizations: [
+    'post /organizations',
+    'patch /organizations/:orgId',
+    'delete /organizations/:orgId',
+  ],
   view_organizations: ['get /organizations', 'get /organizations/:orgId'],
 
   // Members
   manage_org_members: [
     'post /organizations/:orgId/members',
     'delete /organizations/:orgId/members/:userId',
+    // Managing members includes managing their credit top-ups.
+    'post /organizations/:orgId/members/:userId/credit',
   ],
   view_org_members: ['get /organizations/:orgId/members'],
   view_user_permissions: ['get /organizations/:orgId/members/:userId/permissions'],
@@ -58,12 +66,33 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
 
   // Orders (top-level resource; org carried in body/query, or derived from the order)
   //
-  // A client with `place_order` can place orders and read *their own* orders and
-  // history. Operations staff with `manage_order` process orders (status moves)
-  // and can read *every* order in the org and its history. The read routes are
-  // therefore granted by both; OrderService applies the own-vs-all scoping.
+  // Three order roles, all three read routes reachable by any of them (the caller
+  // needs any one); OrderService applies the row-level scoping:
+  //   - `place_order`  — a client: places their own orders, and while the order is
+  //                      still unlocked edits its qty and changes its status
+  //                      (SHIPPING ↔ ARRIVING, or cancel); reads *their own* orders
+  //                      and history.
+  //   - `review_order` — a reviewer: reviews and locks orders (the client/ops
+  //                      handoff), edits a *locked* order's qty (but NOT its
+  //                      status), and reads *every* order in the org.
+  //   - `manage_order` — operations: drives a *locked* order's status along the
+  //                      warehouse lifecycle, and reads *every locked* order and
+  //                      its history.
+  //
+  // The two PATCH routes are shared and the effective actor is resolved in
+  // OrderService by the lock gate: `patch /orders/:orderId/status` is the client's
+  // pre-lock or operations' post-lock; `patch /orders/:orderId` is the owner's
+  // pre-lock or the reviewer's post-lock.
   place_order: [
     'post /orders',
+    'patch /orders/:orderId',
+    'patch /orders/:orderId/status',
+    'get /orders',
+    'get /orders/:orderId',
+    'get /orders/:orderId/history',
+  ],
+  review_order: [
+    'post /orders/:orderId/lock',
     'patch /orders/:orderId',
     'get /orders',
     'get /orders/:orderId',

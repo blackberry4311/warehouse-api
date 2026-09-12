@@ -14,11 +14,17 @@ import { Permission } from '../entities/permission.entity';
 import { UserGroup } from '../entities/user-group.entity';
 import { GroupPermission } from '../entities/group-permission.entity';
 import { User } from '../entities/user.entity';
+import { OrgFee } from '../entities/org-fee.entity';
+import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
+import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
 import { CreatePermissionDto } from './dto/create-permission.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { SetOrgFeeDto } from './dto/set-org-fee.dto';
+import { TopUpCreditDto } from './dto/top-up-credit.dto';
+import { decodeCursor, parseLimit, toPage } from '../common/pagination.util';
 
 /**
  * Manages everything under an organization: membership, groups (roles),
@@ -35,6 +41,8 @@ export class OrganizationService {
     @InjectRepository(UserGroup) private userGroupRepo: Repository<UserGroup>,
     @InjectRepository(GroupPermission) private groupPermRepo: Repository<GroupPermission>,
     @InjectRepository(User) private userRepo: Repository<User>,
+    @InjectRepository(OrgFee) private orgFeeRepo: Repository<OrgFee>,
+    @InjectRepository(CreditHistory) private creditHistoryRepo: Repository<CreditHistory>,
   ) {}
 
   // --- Organizations -------------------------------------------------------
@@ -52,6 +60,12 @@ export class OrganizationService {
     const org = await this.orgRepo.findOne({ where: { id: orgId } });
     if (!org) throw new NotFoundException('Organization not found');
     return org;
+  }
+
+  async updateOrganization(orgId: string, dto: UpdateOrganizationDto) {
+    const org = await this.getOrganization(orgId);
+    org.name = dto.name;
+    return this.orgRepo.save(org);
   }
 
   async deleteOrganization(orgId: string) {
@@ -359,6 +373,138 @@ export class OrganizationService {
 
     const saved = await this.userRepo.save(target);
     return { id: saved.id, email: saved.email, displayName: saved.displayName };
+  }
+
+  // --- Org fees (system-admin only) ---------------------------------------
+
+  /**
+   * Upsert an org's flat fee for an action (e.g. the `ORDER_LOCK` fee charged when
+   * a reviewer locks an order). System-admin only — this is billing config, not an
+   * org-scoped, permission-gated operation. Returns the stored fee row.
+   */
+  async setOrgFee(actingUserId: string, orgId: string, dto: SetOrgFeeDto) {
+    const actor = await this.ensureUserExists(actingUserId);
+    if (!actor.isAdmin) throw new ForbiddenException('Only a system admin can configure fees');
+    await this.getOrganization(orgId);
+
+    await this.orgFeeRepo.upsert({ orgId, feeType: dto.feeType, amount: dto.amount }, [
+      'orgId',
+      'feeType',
+    ]);
+    return this.orgFeeRepo.findOne({ where: { orgId, feeType: dto.feeType } });
+  }
+
+  /** List an org's configured fees. System-admin only (billing config). */
+  async listOrgFees(actingUserId: string, orgId: string) {
+    const actor = await this.ensureUserExists(actingUserId);
+    if (!actor.isAdmin) throw new ForbiddenException('Only a system admin can view fees');
+    await this.getOrganization(orgId);
+    return this.orgFeeRepo.find({ where: { orgId } });
+  }
+
+  // --- Member credit -------------------------------------------------------
+
+  /**
+   * Add funds to a member's credit, recording a `TOP_UP` ledger entry. Gated by the
+   * `manage_org_members` permission (via API_PERMISSION_MAP): the people who manage
+   * an org's members also manage their top-ups. The acting user must belong to the
+   * org (admins excepted) and the target must be a member of it. The balance read,
+   * update and ledger row run in one transaction with a `FOR UPDATE` row lock so
+   * concurrent top-ups (or an order-lock charge) can't race.
+   */
+  async topUpCredit(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    dto: TopUpCreditDto,
+  ) {
+    await this.getOrganization(orgId);
+    await this.assertOrgMembership(orgId, actingUserId);
+
+    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: targetUserId } });
+    if (!membership) throw new NotFoundException('User is not a member of this organization');
+
+    return this.userRepo.manager.transaction(async (em) => {
+      const rows: Array<{ credit: string }> = await em.query(
+        `SELECT credit FROM wh.users WHERE id = $1 FOR UPDATE`,
+        [targetUserId],
+      );
+      if (rows.length === 0) throw new NotFoundException('User not found');
+
+      const prevBalance = parseFloat(rows[0].credit);
+      const newBalance = prevBalance + dto.amount;
+
+      await em.update(User, { id: targetUserId }, { credit: newBalance });
+
+      const entry = await em.save(
+        em.create(CreditHistory, {
+          userId: targetUserId,
+          orgId,
+          entryType: CreditEntryType.TOP_UP,
+          amount: dto.amount,
+          prevBalance,
+          newBalance,
+          orderId: null,
+          note: dto.note ?? null,
+        }),
+      );
+
+      return { userId: targetUserId, credit: newBalance, entryId: entry.id };
+    });
+  }
+
+  /**
+   * A member's credit at a glance: their current wallet balance plus the ledger of
+   * changes recorded in this org (charges and top-ups), newest first and keyset-
+   * paginated by `(created_at, id)` — for the member to review their own spend, or a
+   * manager to review theirs. Readable by the member themselves, a system admin, or
+   * a `manage_org_members` holder in the org.
+   *
+   * `credit` is the member's total wallet balance (a single pool across all orgs);
+   * `history` is scoped to this org, so a manager of one org never sees another
+   * org's activity. Each ledger row still carries its own `prevBalance`/`newBalance`
+   * snapshot, so an org-filtered row remains self-consistent.
+   */
+  async getMemberCredit(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    limitRaw?: string,
+    cursor?: string,
+  ) {
+    await this.getOrganization(orgId);
+    const actor = await this.ensureUserExists(actingUserId);
+
+    // Self, system admin, or a member-manager in this org may view it.
+    if (actingUserId !== targetUserId && !actor.isAdmin) {
+      const canManage = await this.hasOrgPermission(orgId, actingUserId, 'manage_org_members');
+      if (!canManage) throw new ForbiddenException("You cannot view this member's credit");
+    }
+
+    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: targetUserId } });
+    if (!membership) throw new NotFoundException('User is not a member of this organization');
+
+    const target = await this.ensureUserExists(targetUserId);
+
+    const limit = parseLimit(limitRaw);
+    const qb = this.creditHistoryRepo
+      .createQueryBuilder('c')
+      .where('c.userId = :userId', { userId: targetUserId })
+      .andWhere('c.orgId = :orgId', { orgId })
+      .orderBy('c.createdAt', 'DESC')
+      .addOrderBy('c.id', 'DESC')
+      .take(limit + 1);
+
+    if (cursor) {
+      const { t, id } = decodeCursor(cursor);
+      qb.andWhere('(c.createdAt < :t OR (c.createdAt = :t AND c.id < :id))', {
+        t: new Date(t),
+        id,
+      });
+    }
+
+    const history = toPage(await qb.getMany(), limit);
+    return { userId: target.id, orgId, credit: target.credit, history };
   }
 
   private async ensureUserExists(userId: string) {

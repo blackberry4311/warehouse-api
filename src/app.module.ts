@@ -14,6 +14,8 @@ import { GroupPermission } from './entities/group-permission.entity';
 import { Order } from './entities/order.entity';
 import { OrderHistory } from './entities/order-history.entity';
 import { OrderSequence } from './entities/order-sequence.entity';
+import { OrgFee } from './entities/org-fee.entity';
+import { CreditHistory } from './entities/credit-history.entity';
 import { AuthModule } from './auth/auth.module';
 import { OrganizationModule } from './organization/organization.module';
 import { OrderModule } from './order/order.module';
@@ -39,6 +41,8 @@ import { OrderModule } from './order/order.module';
           Order,
           OrderHistory,
           OrderSequence,
+          OrgFee,
+          CreditHistory,
         ],
         synchronize: false,
       }),

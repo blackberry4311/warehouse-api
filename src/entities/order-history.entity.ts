@@ -14,6 +14,8 @@ export enum OrderChangeType {
   CREATED = 'CREATED',
   STATUS_CHANGE = 'STATUS_CHANGE',
   QTY_CHANGE = 'QTY_CHANGE',
+  /** A reviewer (`review_order`) locked the order, handing it to operations. */
+  LOCKED = 'LOCKED',
 }
 
 /**

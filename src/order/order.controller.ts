@@ -5,6 +5,7 @@ import { OrderService } from './order.service';
 import { PlaceOrderDto } from './dto/place-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
+import { LockOrderDto } from './dto/lock-order.dto';
 
 @Controller('orders')
 export class OrderController {
@@ -23,8 +24,9 @@ export class OrderController {
     @Query('cursor') cursor?: string,
     @Query('status') status?: string,
     @Query('search') search?: string,
+    @Query('locked') locked?: string,
   ) {
-    return this.orderService.listOrders(actor.userId, orgId, limit, cursor, status, search);
+    return this.orderService.listOrders(actor.userId, orgId, limit, cursor, status, search, locked);
   }
 
   @Get(':orderId')
@@ -42,6 +44,15 @@ export class OrderController {
     @Body() dto: UpdateOrderDto,
   ) {
     return this.orderService.updateOrder(actor.userId, orderId, dto);
+  }
+
+  @Post(':orderId/lock')
+  lockOrder(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+    @Body() dto: LockOrderDto,
+  ) {
+    return this.orderService.lockOrder(actor.userId, orderId, dto);
   }
 
   @Patch(':orderId/status')

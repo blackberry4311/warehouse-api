@@ -7,6 +7,7 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { JwtAccessGuard } from '../auth/guards/jwt-access.guard';
@@ -14,6 +15,7 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/interfaces/jwt-payload.interface';
 import { OrganizationService } from './organization.service';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
+import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { AddMemberDto } from './dto/add-member.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
 import { AssignGroupDto } from './dto/assign-group.dto';
@@ -21,6 +23,8 @@ import { CreatePermissionDto } from './dto/create-permission.dto';
 import { AssignPermissionDto } from './dto/assign-permission.dto';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { SetOrgFeeDto } from './dto/set-org-fee.dto';
+import { TopUpCreditDto } from './dto/top-up-credit.dto';
 
 // Access control is enforced globally by PermissionsGuard via API_PERMISSION_MAP
 // (see src/auth/permissions.config.ts) — no per-route guards/decorators here.
@@ -68,9 +72,40 @@ export class OrganizationController {
     return this.orgService.getOrganization(orgId);
   }
 
+  @Patch(':orgId')
+  updateOrganization(
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Body() dto: UpdateOrganizationDto,
+  ) {
+    return this.orgService.updateOrganization(orgId, dto);
+  }
+
   @Delete(':orgId')
   deleteOrganization(@Param('orgId', ParseUUIDPipe) orgId: string) {
     return this.orgService.deleteOrganization(orgId);
+  }
+
+  // --- Org fees (system-admin only) ----------------------------------------
+  // Not in PERMISSION_API_MAP: JwtAccessGuard enforces auth, the service enforces
+  // is_admin. Billing config is a system-admin concern, not an org permission.
+
+  @Post(':orgId/fees')
+  @UseGuards(JwtAccessGuard)
+  setOrgFee(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Body() dto: SetOrgFeeDto,
+  ) {
+    return this.orgService.setOrgFee(actor.userId, orgId, dto);
+  }
+
+  @Get(':orgId/fees')
+  @UseGuards(JwtAccessGuard)
+  listOrgFees(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+  ) {
+    return this.orgService.listOrgFees(actor.userId, orgId);
   }
 
   // --- Membership ----------------------------------------------------------
@@ -99,6 +134,31 @@ export class OrganizationController {
     @Param('userId', ParseUUIDPipe) userId: string,
   ) {
     return this.orgService.getUserPermissions(orgId, userId);
+  }
+
+  // Top up a member's credit (gated by manage_org_members — see PERMISSION_API_MAP).
+  @Post(':orgId/members/:userId/credit')
+  topUpCredit(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Body() dto: TopUpCreditDto,
+  ) {
+    return this.orgService.topUpCredit(actor.userId, orgId, userId, dto);
+  }
+
+  // Read a member's credit balance + ledger. Authenticated-only; the service
+  // authorizes (self, admin, or a manage_org_members holder). Cursor-paginated.
+  @Get(':orgId/members/:userId/credit')
+  @UseGuards(JwtAccessGuard)
+  getMemberCredit(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+  ) {
+    return this.orgService.getMemberCredit(actor.userId, orgId, userId, limit, cursor);
   }
 
   @Get(':orgId/members/:userId/groups')
