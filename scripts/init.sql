@@ -136,15 +136,12 @@ create table orders
         references users
             on update cascade,
     qty          numeric                                                           not null,
+    tracking     text                                                              not null,
     status       varchar(50)                 default 'SHIPPING'::character varying not null
         constraint orders_status_check
             check ((status)::text = ANY
                    ((ARRAY ['SHIPPING'::character varying, 'ARRIVING'::character varying, 'IN_WAREHOUSE'::character varying, 'COMPLETED'::character varying, 'CANCELLED'::character varying])::text[])),
     locked       boolean                     default false                         not null,
-    locked_at    timestamp with time zone,
-    locked_by_fk uuid
-        references users
-            on update cascade,
     created_at   timestamp(3) with time zone default now()                         not null,
     updated_at   timestamp with time zone
 );

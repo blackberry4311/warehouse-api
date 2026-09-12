@@ -130,6 +130,7 @@ export class OrderService {
           orgId,
           userId,
           qty: dto.qty,
+          tracking: dto.tracking,
           status,
         }),
       );
@@ -365,10 +366,10 @@ export class OrderService {
       }
 
       order.locked = true;
-      order.lockedAt = new Date();
-      order.lockedBy = userId;
       const saved = await em.save(order);
 
+      // When and by whom it was locked are captured by this LOCKED history row
+      // (its `createdAt` and `changedBy`).
       await em.save(
         em.create(OrderHistory, {
           orderId: order.id,

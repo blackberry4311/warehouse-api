@@ -45,6 +45,14 @@ export class Order {
   @Column({ type: 'numeric', transformer: numericTransformer })
   qty: number;
 
+  /**
+   * Free-text tracking reference (typically a URL) the client supplies at
+   * placement, pointing at the external carrier's system for the shipping /
+   * arriving progress. Required — goods always move through an external shipper.
+   */
+  @Column({ type: 'text' })
+  tracking: string;
+
   @Column({ type: 'varchar', length: 50, default: OrderStatus.SHIPPING })
   status: OrderStatus;
 
@@ -58,13 +66,6 @@ export class Order {
   @Column({ type: 'boolean', default: false })
   locked: boolean;
 
-  @Column({ type: 'timestamptz', name: 'locked_at', nullable: true })
-  lockedAt: Date | null;
-
-  /** The reviewer who locked the order (null while unlocked). */
-  @Column({ type: 'uuid', name: 'locked_by_fk', nullable: true })
-  lockedBy: string | null;
-
   @ManyToOne(() => Organization, { onDelete: 'CASCADE', onUpdate: 'CASCADE' })
   @JoinColumn({ name: 'org_id_fk' })
   organization: Organization;
@@ -72,11 +73,6 @@ export class Order {
   @ManyToOne(() => User, { onUpdate: 'CASCADE' })
   @JoinColumn({ name: 'user_id_fk' })
   user: User;
-
-  /** Relation to the locking reviewer, layered on `locked_by_fk` (see `lockedBy`). */
-  @ManyToOne(() => User, { onUpdate: 'CASCADE' })
-  @JoinColumn({ name: 'locked_by_fk' })
-  lockedByUser: User;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;

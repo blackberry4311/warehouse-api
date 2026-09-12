@@ -19,6 +19,7 @@ import { CreditHistory } from './entities/credit-history.entity';
 import { AuthModule } from './auth/auth.module';
 import { OrganizationModule } from './organization/organization.module';
 import { OrderModule } from './order/order.module';
+import { UserModule } from './user/user.module';
 
 @Module({
   imports: [
@@ -51,6 +52,7 @@ import { OrderModule } from './order/order.module';
     AuthModule,
     OrganizationModule,
     OrderModule,
+    UserModule,
   ],
   exports: [TypeOrmModule],
   controllers: [AppController],

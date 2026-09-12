@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `warehouse-api`: a NestJS 11 (Fastify) backend. It implements JWT-based authentication
 (register / login / refresh / logout), a **multi-tenant RBAC layer** (organizations, membership,
 groups/roles, and permissions), an **order system** (org-scoped orders with a status lifecycle
-and an audit trail), and a **credit / billing layer** (a per-user credit wallet charged a per-org
-fee when an order is locked, with a full ledger), all over a Postgres database in the `wh` schema.
+and an audit trail), a **credit / billing layer** (a per-user credit wallet charged a per-org
+fee when an order is locked, with a full ledger), and a small **self-service layer** (the
+authenticated user reads/updates their own profile and reviews their own wallet), all over a
+Postgres database in the `wh` schema.
 
 `@anthropic-ai/sdk` is listed as a dependency but is not yet used anywhere in `src/`.
 
@@ -62,7 +64,7 @@ class-validator decorators and unknown properties are rejected.
 - `AppModule` wires global `ConfigModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
-  `OrganizationModule`, and `OrderModule`.
+  `OrganizationModule`, `OrderModule`, and `UserModule`.
 - `AuthModule` — registration/login/refresh/logout. Uses `@nestjs/jwt`, `bcrypt` for password
   hashing, and two Passport JWT strategies:
   - `jwt-access` (Bearer header) — guards ordinary endpoints via `JwtAccessGuard`.
@@ -81,6 +83,12 @@ class-validator decorators and unknown properties are rejected.
   credit charge on lock, which reads `org_fees` and writes `credit_history` directly in its
   transaction. Both `OrderService` and `OrganizationService` (for the credit ledger) share the keyset
   pagination helper in `src/common/pagination.util.ts`.
+- `UserModule` (`src/user/`) — self-service for the authenticated user: read/update their own profile
+  and review their own wallet (`/users/me*`). Standalone module (its own `UserService` over
+  `forFeature([User, CreditHistory])`); it does **not** depend on `OrganizationModule`. Every route is
+  authenticated-only (`@UseGuards(JwtAccessGuard)` on the controller, left out of `PERMISSION_API_MAP`)
+  and scoped to the caller's own id, so there is no permission or cross-user check to enforce. Reuses
+  the shared keyset pagination helper for the credit ledger.
 
 ### Organization / RBAC endpoints (`OrganizationController`, prefix `organizations`)
 - Me: `GET /organizations/me` — the caller's access tree
@@ -118,8 +126,8 @@ used to act on another — mirroring `POST /organizations/users`.
 
 **Three order roles + the review/lock gate + row-level scoping.** Access to an order is driven by
 three permissions, split around a **lock** — a reviewer's one-way gate that hands an order off from
-the client to operations (`orders.locked`, plus `locked_at` / `locked_by_fk` for audit; orthogonal to
-`status`):
+the client to operations (`orders.locked`; when and by whom it was locked are recorded on the `LOCKED`
+`order_history` row's `created_at` / `changed_by_fk`, not on the order; orthogonal to `status`):
 - `place_order` — a **client**: places orders, and while the order is still **unlocked** edits its qty
   and drives its two client-reported pending states (`SHIPPING ↔ ARRIVING`) or cancels it; reads
   **only the orders they placed** (and those orders' history).
@@ -141,7 +149,8 @@ outside their scope, so they can't probe which orders exist. `listOrders` also a
 `?locked=true|false` filter (useful for a reviewer splitting their review queue from the processed set).
 
 - `POST /orders` (`place_order`) — client places an order. Body `PlaceOrderDto` (`orgId`, `qty`,
-  optional `note`). Created as `SHIPPING`, unlocked.
+  **required** `tracking` — a free-text carrier reference/URL, since goods always ship via an external
+  system, optional `note`). Created as `SHIPPING`, unlocked.
 - `GET /orders?orgId=:orgId` (`place_order` | `review_order` | `manage_order`) — list an org's orders
   (`orgId` required query param), newest first; scoped per the roles above. Optional `?status=`,
   `?search=`, `?locked=` filters. Cursor-paginated (see below).
@@ -247,6 +256,28 @@ recorded in an append-only ledger (`credit_history`). The credit logic is split 
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
   (`ORDER_LOCK`, `SHIPMENT_REQUEST`) in `credit_history` — top-ups (positive) are excluded.
 
+### User self-service endpoints (`UserController`, prefix `users`)
+Self-service for the **authenticated caller**, scoped entirely to `/me` — every action targets the
+id resolved from the access token, so there is no target-user param and no permission/cross-user
+check. All routes are **authenticated-only**: `@UseGuards(JwtAccessGuard)` on the controller, and
+deliberately **not** in `PERMISSION_API_MAP` (the global `PermissionsGuard` treats unlisted routes as
+public and passes through; `JwtAccessGuard` then enforces auth and sets `req.user`). Contrast with the
+admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the manager's org-scoped
+`GET /organizations/:orgId/members/:userId/credit`.
+- `GET /users/me` — the caller's own profile: `{ id, email, displayName, code, isAdmin, credit,
+  createdAt, updatedAt }`. Safe columns only — never `password_hash`.
+- `PATCH /users/me` — update the caller's own profile. Body `UpdateProfileDto` (`displayName`,
+  `password`); mirrors `UpdateUserDto` — `email` (and `code`) are intentionally absent, so with the
+  global `forbidNonWhitelisted` they can't be changed here. A new password is re-hashed with `bcrypt`.
+- `GET /users/me/credit` — `{ userId, credit, history }`: the caller's **global** wallet balance plus
+  their credit ledger across **all** orgs (the wallet is one pool spanning orgs), newest first and
+  cursor-paginated (`limit`/`cursor`, same keyset scheme as the other lists), backed by the
+  `credit_history (user_id_fk, created_at desc, id desc)` index. This is the per-user read path, as
+  opposed to `OrganizationService.getMemberCredit`, which scopes the ledger to a single org.
+
+`UserModule` adds no new entities or tables — it reads/writes existing `users` columns and reads
+`credit_history`, so `scripts/init.sql` is unchanged.
+
 ### Authorization: map-driven global guard
 - **`src/auth/permissions.config.ts` — `PERMISSION_API_MAP`** is the authored source of truth. It maps
   each permission **name** → the array of `"<method> <route path>"` routes it grants (lowercase method,
@@ -308,9 +339,10 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 
 **Order tables** (entity ↔ table):
 - `Order` → `orders` — an order placed into an org. `order_number` unique per org, `org_id_fk`,
-  `user_id_fk` (the client who placed it), `qty` (numeric), `status` (`CHECK`-constrained), and the
-  review gate `locked` / `locked_at` / `locked_by_fk` (`lockedByUser` `@ManyToOne(User)` relation
-  layered on `locked_by_fk`, like `changedByUser` below). Composite index
+  `user_id_fk` (the client who placed it), `qty` (numeric), `tracking` (`text`, NOT NULL — the client's
+  free-text carrier reference/URL, supplied at placement), `status` (`CHECK`-constrained), and the
+  review gate `locked` (when and by whom it was locked aren't stored on the order — they're the
+  `LOCKED` `order_history` row's `created_at` / `changed_by_fk`). Composite index
   `orders_org_locked_created_idx (org_id_fk, locked, created_at desc, id desc)` backs the operations
   queue (the `locked = true` keyset scan).
 - `OrderHistory` → `order_history` — append-only audit log (`change_type`, `prev_*`/`new_*` columns;
