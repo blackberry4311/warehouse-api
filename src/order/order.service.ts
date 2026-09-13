@@ -279,13 +279,20 @@ export class OrderService {
         throw new BadRequestException('Order can only be edited while shipping or arriving');
       }
     }
-    if (dto.qty === order.qty) {
-      throw new BadRequestException(`Quantity is already ${order.qty}`);
+    const qtyChanged = dto.qty !== undefined && dto.qty !== order.qty;
+    const trackingChanged = dto.tracking !== undefined && dto.tracking !== order.tracking;
+    if (!qtyChanged && !trackingChanged) {
+      throw new BadRequestException('Nothing to update: qty and tracking are unchanged');
     }
 
     return this.orderRepo.manager.transaction(async (em) => {
       const prevQty = order.qty;
-      order.qty = dto.qty;
+      if (qtyChanged) {
+        order.qty = dto.qty as number;
+      }
+      if (trackingChanged) {
+        order.tracking = dto.tracking as string;
+      }
       const saved = await em.save(order);
 
       await em.save(
@@ -294,7 +301,7 @@ export class OrderService {
           changedBy: userId,
           changeType: OrderChangeType.QTY_CHANGE,
           prevQty,
-          newQty: dto.qty,
+          newQty: order.qty,
           note: dto.note ?? null,
         }),
       );
