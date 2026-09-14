@@ -104,6 +104,37 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'get /orders/:orderId',
     'get /orders/:orderId/history',
   ],
+
+  // Shipments (outbound withdrawals of warehoused goods) — the mirror of orders.
+  // Three roles, all read routes reachable by any of them; ShipmentService applies
+  // the row-level scoping and the lock-gated split of the shared PATCH routes:
+  //   - `place_shipment`  — a client: requests shipments against their own
+  //                         warehoused orders, and while unlocked edits their lines
+  //                         or cancels them; reads *their own* shipments and history.
+  //   - `review_shipment` — a reviewer: reviews and locks shipments (the billing +
+  //                         stock-deduction handoff), and reads *every* shipment.
+  //   - `manage_shipment` — operations: drives a *locked* shipment to DELIVERED /
+  //                         CANCELLED, and reads *every locked* shipment and history.
+  place_shipment: [
+    'post /shipments',
+    'patch /shipments/:shipmentId',
+    'patch /shipments/:shipmentId/status',
+    'get /shipments',
+    'get /shipments/:shipmentId',
+    'get /shipments/:shipmentId/history',
+  ],
+  review_shipment: [
+    'post /shipments/:shipmentId/lock',
+    'get /shipments',
+    'get /shipments/:shipmentId',
+    'get /shipments/:shipmentId/history',
+  ],
+  manage_shipment: [
+    'patch /shipments/:shipmentId/status',
+    'get /shipments',
+    'get /shipments/:shipmentId',
+    'get /shipments/:shipmentId/history',
+  ],
 };
 
 /**

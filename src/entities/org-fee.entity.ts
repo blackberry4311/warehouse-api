@@ -4,13 +4,12 @@ import { numericTransformer } from './numeric.transformer';
 
 /**
  * The kinds of predefined, per-org fees. `ORDER_LOCK` is charged when a reviewer
- * locks an order; `SHIPMENT_REQUEST` is reserved for the upcoming shipment flow.
- * Values match the `org_fees.fee_type` CHECK and the charge-type entries in
- * `CreditEntryType`.
+ * locks an order; `SHIPMENT_LOCK` when a reviewer locks a shipment. Values match
+ * the `org_fees.fee_type` CHECK and the charge-type entries in `CreditEntryType`.
  */
 export enum FeeType {
   ORDER_LOCK = 'ORDER_LOCK',
-  SHIPMENT_REQUEST = 'SHIPMENT_REQUEST',
+  SHIPMENT_LOCK = 'SHIPMENT_LOCK',
 }
 
 /**

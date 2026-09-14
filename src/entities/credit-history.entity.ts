@@ -8,11 +8,12 @@ import {
 } from 'typeorm';
 import { Organization } from './organization.entity';
 import { Order } from './order.entity';
+import { Shipment } from './shipment.entity';
 import { User } from './user.entity';
 import { numericTransformer } from './numeric.transformer';
 
 /**
- * Why a user's credit changed. The charge types (`ORDER_LOCK`, `SHIPMENT_REQUEST`)
+ * Why a user's credit changed. The charge types (`ORDER_LOCK`, `SHIPMENT_LOCK`)
  * mirror `FeeType` and are what warehouse earnings sum over; `TOP_UP` and
  * `ADJUSTMENT` cover the client adding funds and manual corrections.
  */
@@ -20,7 +21,7 @@ export enum CreditEntryType {
   /** Charged when a reviewer locks the client's order. */
   ORDER_LOCK = 'ORDER_LOCK',
   /** Reserved for the upcoming shipment-request flow. */
-  SHIPMENT_REQUEST = 'SHIPMENT_REQUEST',
+  SHIPMENT_LOCK = 'SHIPMENT_LOCK',
   /** The client added funds. */
   TOP_UP = 'TOP_UP',
   /** Manual correction. */
@@ -64,6 +65,10 @@ export class CreditHistory {
   @Column({ type: 'uuid', name: 'order_id_fk', nullable: true })
   orderId: string | null;
 
+  /** The shipment that triggered the charge, if any (a SHIPMENT_LOCK fee). */
+  @Column({ type: 'uuid', name: 'shipment_id_fk', nullable: true })
+  shipmentId: string | null;
+
   @Column({ type: 'text', nullable: true })
   note: string | null;
 
@@ -78,6 +83,10 @@ export class CreditHistory {
   @ManyToOne(() => Order, { onDelete: 'SET NULL', onUpdate: 'CASCADE' })
   @JoinColumn({ name: 'order_id_fk' })
   order: Order | null;
+
+  @ManyToOne(() => Shipment, { onDelete: 'SET NULL', onUpdate: 'CASCADE' })
+  @JoinColumn({ name: 'shipment_id_fk' })
+  shipment: Shipment | null;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;

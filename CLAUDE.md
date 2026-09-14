@@ -7,8 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `warehouse-api`: a NestJS 11 (Fastify) backend. It implements JWT-based authentication
 (register / login / refresh / logout), a **multi-tenant RBAC layer** (organizations, membership,
 groups/roles, and permissions), an **order system** (org-scoped orders with a status lifecycle
-and an audit trail), a **credit / billing layer** (a per-user credit wallet charged a per-org
-fee when an order is locked, with a full ledger), and a small **self-service layer** (the
+and an audit trail), a **shipment system** (org-scoped outbound shipments that draw quantity from
+one or more warehoused orders, mirroring the order flow — status lifecycle, review-lock gate, and
+audit trail), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
+order or a shipment is locked, with a full ledger), and a small **self-service layer** (the
 authenticated user reads/updates their own profile and reviews their own wallet), all over a
 Postgres database in the `wh` schema.
 
@@ -64,7 +66,7 @@ class-validator decorators and unknown properties are rejected.
 - `AppModule` wires global `ConfigModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
-  `OrganizationModule`, `OrderModule`, and `UserModule`.
+  `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, and `UserModule`.
 - `AuthModule` — registration/login/refresh/logout. Uses `@nestjs/jwt`, `bcrypt` for password
   hashing, and two Passport JWT strategies:
   - `jwt-access` (Bearer header) — guards ordinary endpoints via `JwtAccessGuard`.
@@ -74,8 +76,15 @@ class-validator decorators and unknown properties are rejected.
 - `OrganizationModule` (`src/organization/`) — manages everything under an organization: the org
   itself, membership (users_orgs), groups/roles (org_groups), the global permission catalog
   (permissions), the group↔permission and user↔group wiring, and the **credit / billing layer**
-  (per-org fees, member credit top-ups, and the credit-review endpoint). It registers the global
-  `PermissionsGuard` (via `APP_GUARD`) and exports `OrganizationService` for reuse.
+  (per-org fees, member credit top-ups, and the credit-review endpoint). It exports
+  `OrganizationService` for reuse (by `RbacModule` for permission resolution, and by the order /
+  shipment / self-service modules); it does **not** own the global guard.
+- `RbacModule` (`src/rbac/`) — the authorization layer: registers the map-driven global
+  `PermissionsGuard` (via `APP_GUARD`, so it runs on every route) and owns the authored
+  `PERMISSION_API_MAP` source of truth (`src/rbac/permissions.config.ts`). Imports `OrganizationModule`
+  for `OrganizationService` (permission resolution), plus `JwtModule` and the `User` repo the guard
+  needs. Nothing imports `RbacModule` back, so the graph stays acyclic (Rbac → Organization → Auth);
+  `AuthModule` stays a lean authN-only module and does **not** know a guard exists.
 - `OrderModule` (`src/order/`) — the order system: place orders, drive their status lifecycle, and
   read orders + history. Standalone module (not part of `OrganizationModule`); it imports
   `OrganizationModule` only to reuse `OrganizationService` (org existence, `assertOrgMembership`,
@@ -83,6 +92,13 @@ class-validator decorators and unknown properties are rejected.
   credit charge on lock, which reads `org_fees` and writes `credit_history` directly in its
   transaction. Both `OrderService` and `OrganizationService` (for the credit ledger) share the keyset
   pagination helper in `src/common/pagination.util.ts`.
+- `ShipmentModule` (`src/shipment/`) — the shipment system: request shipments (each drawing quantity
+  from one or more warehoused orders), review/lock them, drive their status, and read shipments +
+  history. Structurally the mirror of `OrderModule` — standalone, imports `OrganizationModule` only to
+  reuse `OrganizationService`. All logic lives in `ShipmentService`, including the `SHIPMENT_LOCK`
+  credit charge **and** the stock deduction on lock (it adds each line's qty to the order's
+  `shipped_qty` and writes `order_history` for any order it completes, all in the lock transaction).
+  Shares the keyset pagination helper.
 - `UserModule` (`src/user/`) — self-service for the authenticated user: read/update their own profile
   and review their own wallet (`/users/me*`). Standalone module (its own `UserService` over
   `forFeature([User, CreditHistory])`); it does **not** depend on `OrganizationModule`. Every route is
@@ -187,8 +203,9 @@ microsecond precision would make the cursor skip rows.
 **Status lifecycle** (`OrderStatus` enum + a DB `CHECK`): `SHIPPING → ARRIVING → IN_WAREHOUSE →
 COMPLETED`, with `CANCELLED` reachable from any live (non-terminal) state;
 `COMPLETED`/`CANCELLED` are terminal. Once an order reaches `IN_WAREHOUSE` the client can request a
-shipment (that flow is future work). The allowed moves are **split by the lock gate** into two tables
-in `OrderService`:
+shipment against it (see the **Shipment system** below); an order is also driven to `COMPLETED`
+automatically — not by `updateStatus` — when shipments have shipped out all of its `qty`. The allowed
+moves are **split by the lock gate** into two tables in `OrderService`:
 - `CLIENT_TRANSITIONS` — what the owning client may do while **unlocked**: `SHIPPING ↔ ARRIVING`
   (report their shipment) and cancel. These are the two client-reported pending states.
 - `MANAGE_TRANSITIONS` — what operations may do once **locked**: push from either pending state into
@@ -219,17 +236,80 @@ group-permission endpoints — `place_order` to a client group (place/edit + rea
 `review_order` to a Review group (review/lock + read all orders), `manage_order` to an Operations group
 (process + read all locked orders in the org).
 
+### Shipment system (`ShipmentController`, prefix `shipments`)
+A **shipment** is a client's request to withdraw goods back out of the warehouse: it draws quantity
+from one or more of the client's own warehoused orders. The module is the **mirror of the order
+system** — same top-level org-scoped resource shape, same three-role + review/lock gate, same
+row-level scoping, same cursor pagination and audit trail — so most of the order-system notes above
+apply verbatim, with these shipment-specific points:
+
+**Shipment ↔ order is many-to-many.** One shipment can ship (say) 10 units from order A and 20 from
+order B. The per-order quantities live on the `shipment_details` junction (`Shipment.items`), keyed
+`(shipment_id_fk, order_id_fk)` with a `qty` column. A shipment only references orders the placing
+client owns, in the shipment's org, that are `IN_WAREHOUSE` with enough **remaining** qty
+(`orders.qty - orders.shipped_qty`).
+
+**Three roles + the review/lock gate** (identical structure to orders, resolved by
+`ShipmentService.resolveAccess` via `OrganizationService.hasOrgPermission`):
+- `place_shipment` — a **client**: requests shipments against their own orders, and while **unlocked**
+  edits the line set / tracking (`PATCH /shipments/:shipmentId`) or cancels; reads **only their own**
+  shipments and history.
+- `review_shipment` — a **reviewer**: reviews and **locks** a `REQUESTED` shipment
+  (`POST /shipments/:shipmentId/lock`); reads **every** shipment in the org. Only `review_shipment` can
+  lock. (There is no reviewer edit-after-lock, unlike orders — a locked shipment's lines are fixed.)
+- `manage_shipment` — **operations**: drives a **locked** shipment to `DELIVERED`/`CANCELLED`
+  (`PATCH /shipments/:shipmentId/status`), and reads **every *locked*** shipment and its history.
+
+The read routes (`GET /shipments`, `GET /shipments/:shipmentId`, `GET /shipments/:shipmentId/history`)
+are reachable by any of the three; `ShipmentService` applies the same own/all/locked-only scoping and
+`404`-on-out-of-scope as orders. `GET /shipments` takes a required `?orgId=`, optional `?status=`,
+`?search=` (shipment number), `?locked=`, and keyset `limit`/`cursor`. `GET /shipments/:shipmentId`
+returns the shipment with its `items` (each carrying the referenced order's number/qty/status).
+
+**Status lifecycle** (`ShipmentStatus` enum + DB `CHECK`): `REQUESTED → DELIVERED`, with `CANCELLED`
+reachable from `REQUESTED`; `DELIVERED`/`CANCELLED` are terminal. Split by the lock gate in
+`ShipmentService` (`CLIENT_SHIPMENT_TRANSITIONS` / `MANAGE_SHIPMENT_TRANSITIONS`): while **unlocked**
+only the owning client may act (cancel a `REQUESTED` shipment); once **locked** only operations may act
+(`DELIVERED` or `CANCELLED`). Locking does **not** change `status` (it stays `REQUESTED`), exactly like
+orders.
+
+**Lock is the billing + stock-deduction event** (`ShipmentService.lockShipment`, one transaction):
+- the shipment's **client** (`shipment.userId`) is charged the org's flat `SHIPMENT_LOCK` fee — same
+  `FOR UPDATE`/insufficient-credit/`fee 0 = no charge` mechanics as the order-lock charge, writing a
+  `SHIPMENT_LOCK` `credit_history` row linked via the new `credit_history.shipment_id_fk`;
+- each line's `qty` is added to its order's `shipped_qty` (each order row locked `FOR UPDATE` and
+  re-checked so concurrent locks can't over-ship), and any order whose `shipped_qty` reaches its `qty`
+  is moved to `COMPLETED` with an `order_history` `STATUS_CHANGE` row written by the acting reviewer;
+- a `LOCKED` `shipment_history` row is written.
+
+Cancelling a **locked** shipment (operations) **reverses the deduction**: it subtracts each line's qty
+back from the order's `shipped_qty` and reverts any order it had completed back to `IN_WAREHOUSE` (with
+an `order_history` row). The fee is **not** refunded (mirrors orders). Cancelling an unlocked shipment
+moves nothing (nothing was deducted).
+
+**Shipment numbers**: `<user code>-S<6-digit seq>` (e.g. `ACME-S000123`), from a per-`(user, org)`
+`wh.shipment_sequences` counter bumped the same way as `order_sequences`; unique per org. **History**:
+`shipment_history` mirrors `order_history` (`CREATED` on placement, `ITEM_CHANGE` on a client edit,
+`LOCKED` on review, `STATUS_CHANGE` on status moves), with `prev_qty`/`new_qty` holding the shipment's
+**total** qty (summed across lines, since the per-line breakdown is on `shipment_details`), and
+`changedByUser` joined the same way.
+
+**Adding shipment permissions to a group:** the three permissions (`place_shipment`, `review_shipment`,
+`manage_shipment`) are seeded in `scripts/init.sql` and mapped in `PERMISSION_API_MAP`; grant them to
+groups exactly as the order permissions.
+
 ### Credit / billing
-A per-user **credit wallet** (`users.credit`) is charged when an order is locked, with every movement
-recorded in an append-only ledger (`credit_history`). The credit logic is split across `OrderService`
-(the charge) and `OrganizationService` (fees, top-ups, the read endpoint); there is no separate module.
+A per-user **credit wallet** (`users.credit`) is charged when an order **or a shipment** is locked, with
+every movement recorded in an append-only ledger (`credit_history`). The credit logic is split across
+`OrderService` and `ShipmentService` (the charges) and `OrganizationService` (fees, top-ups, the read
+endpoint); there is no separate module.
 
 - **The wallet.** `users.credit` is a single `numeric` balance per user, shared across all orgs (not
   per-org). Exposed as a JS number via `numericTransformer`. New users start at 0.
 - **Per-org fees.** `wh.org_fees` holds a flat `amount` per `(org_id_fk, fee_type)`; `fee_type` is
-  `ORDER_LOCK` today and `SHIPMENT_REQUEST` reserved for the upcoming shipment flow. An org with **no
-  row** for a fee_type is treated as fee **0** (not charged). Fees are billing config: set/listed only
-  by a **system admin** (`is_admin`) via `POST|GET /organizations/:orgId/fees` (`SetOrgFeeDto`:
+  `ORDER_LOCK` (charged on order lock) or `SHIPMENT_LOCK` (charged on shipment lock). An org with
+  **no row** for a fee_type is treated as fee **0** (not charged). Fees are billing config: set/listed
+  only by a **system admin** (`is_admin`) via `POST|GET /organizations/:orgId/fees` (`SetOrgFeeDto`:
   `feeType`, `amount ≥ 0`). These routes are **not** in `PERMISSION_API_MAP` — they use
   `@UseGuards(JwtAccessGuard)` and `OrganizationService.setOrgFee`/`listOrgFees` enforce `is_admin`.
 - **The charge (order lock).** `OrderService.lockOrder` resolves the org's `ORDER_LOCK` fee and, in the
@@ -237,6 +317,9 @@ recorded in an append-only ledger (`credit_history`). The credit logic is split 
   (`order.userId`, not the acting reviewer): it `SELECT … FOR UPDATE`s the client's row (so concurrent
   charges/top-ups can't overdraw), throws `400` if `credit < fee`, deducts, and writes an `ORDER_LOCK`
   ledger row. A fee of 0 charges nothing and writes no ledger row.
+- **The charge (shipment lock).** `ShipmentService.lockShipment` charges the shipment's **client** the
+  org's `SHIPMENT_LOCK` fee identically, writing a `SHIPMENT_LOCK` ledger row linked via
+  `credit_history.shipment_id_fk` (rather than `order_id_fk`). See the **Shipment system** above.
 - **Top-ups.** `POST /organizations/:orgId/members/:userId/credit` (`TopUpCreditDto`: `amount > 0`,
   optional `note`) adds funds and writes a `TOP_UP` ledger row, in a `FOR UPDATE` transaction. Gated by
   **`manage_org_members`** (whoever manages members manages their top-ups); the acting user must belong
@@ -249,12 +332,13 @@ recorded in an append-only ledger (`credit_history`). The credit logic is split 
   carries its own `prevBalance`/`newBalance` snapshot, so an org-filtered row stays self-consistent
   even though the wallet itself spans orgs.
 - **The ledger** (`credit_history`). One row per change: `entry_type`
-  (`ORDER_LOCK` | `SHIPMENT_REQUEST` | `TOP_UP` | `ADJUSTMENT`), a **signed** `amount` (negative = a
-  charge, positive = top-up/refund) so `new_balance = prev_balance + amount` always holds, `order_id_fk`
-  linking a charge to its order (nullable; future flows add their own reference the same way), and the
-  `org_id_fk` the movement happened in.
+  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `TOP_UP` | `ADJUSTMENT`), a **signed** `amount` (negative = a
+  charge, positive = top-up/refund) so `new_balance = prev_balance + amount` always holds, a nullable
+  `order_id_fk` (set on an `ORDER_LOCK` charge) **and** a nullable `shipment_id_fk` (set on a
+  `SHIPMENT_LOCK` charge) linking a charge to what triggered it, and the `org_id_fk` the movement
+  happened in.
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
-  (`ORDER_LOCK`, `SHIPMENT_REQUEST`) in `credit_history` — top-ups (positive) are excluded.
+  (`ORDER_LOCK`, `SHIPMENT_LOCK`) in `credit_history` — top-ups (positive) are excluded.
 
 ### User self-service endpoints (`UserController`, prefix `users`)
 Self-service for the **authenticated caller**, scoped entirely to `/me` — every action targets the
@@ -279,7 +363,7 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
 `credit_history`, so `scripts/init.sql` is unchanged.
 
 ### Authorization: map-driven global guard
-- **`src/auth/permissions.config.ts` — `PERMISSION_API_MAP`** is the authored source of truth. It maps
+- **`src/rbac/permissions.config.ts` — `PERMISSION_API_MAP`** is the authored source of truth. It maps
   each permission **name** → the array of `"<method> <route path>"` routes it grants (lowercase method,
   Nest/Fastify route pattern, e.g. `add_user: ['post /organizations/users', ...]`), so one permission
   can gate many routes. Editing this map changes access at runtime — there are no per-route guards or
@@ -287,7 +371,7 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
   `API_PERMISSION_MAP` (route → **list of** permission names) from it as a reverse index for the
   guard's O(1) lookup; don't edit that directly. A route may be claimed by several permissions (e.g.
   the order read routes) — the guard allows the caller if they hold **any** one of them.
-- `PermissionsGuard` (`src/organization/guards/`) is registered globally via `APP_GUARD`. Per request
+- `PermissionsGuard` (`src/rbac/guards/`) is registered globally via `APP_GUARD` by `RbacModule`. Per request
   it builds the `"<method> <path>"` key and looks it up: not found → allow (public); found → verify
   the Bearer access token (`JwtService` + `JWT_ACCESS_SECRET`), set `request.user`, then allow if the
   user is `is_admin` **or** holds the required permission (via
@@ -326,7 +410,8 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
 Postgres schema is `wh` (not `public`); table/column names are snake_case. `scripts/init.sql` is the
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
-`OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`.
+`OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `Shipment`, `ShipmentDetail`,
+`ShipmentHistory`, `ShipmentSequence`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -353,19 +438,38 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 - `OrderSequence` → `order_sequences` — per-`(user, org)` order-number counter (composite PK
   `user_id_fk, org_id_fk`); mutated via raw `ON CONFLICT` SQL, not the repository.
 - `users.code` — per-user client code feeding order numbers (unique; NULLs allowed).
+- `orders.shipped_qty` (`numeric`, default 0) — how much of `qty` has been shipped back out via locked
+  shipments; `qty - shipped_qty` is what is still shippable, and the order auto-completes when it
+  reaches `qty`.
+
+**Shipment tables** (entity ↔ table; the mirror of the order tables — see **Shipment system** above):
+- `Shipment` → `shipments` — a shipment placed into an org. `shipment_number` unique per org,
+  `org_id_fk`, `user_id_fk` (the requesting client), `status` (`CHECK`: `REQUESTED` | `DELIVERED` |
+  `CANCELLED`), the review gate `locked`, and nullable `tracking`. Composite indexes
+  `shipments_org_created_idx` and `shipments_org_locked_created_idx` mirror the order queues.
+- `ShipmentDetail` → `shipment_details` — the shipment ↔ order many-to-many line, composite PK
+  `(shipment_id_fk, order_id_fk)` with a per-line `qty` (numeric). Reverse index on `order_id_fk`.
+- `ShipmentHistory` → `shipment_history` — append-only audit log mirroring `order_history`
+  (`change_type` is `CREATED` | `STATUS_CHANGE` | `ITEM_CHANGE` | `LOCKED`; `prev_qty`/`new_qty` hold
+  the shipment's total qty; `changedByUser` joined on `changed_by_fk`).
+- `ShipmentSequence` → `shipment_sequences` — per-`(user, org)` shipment-number counter, same shape and
+  raw `ON CONFLICT` handling as `order_sequences`.
 
 **Credit / billing tables** (entity ↔ table; see **Credit / billing** above):
-- `users.credit` — per-user credit wallet (`numeric`, default 0), the balance charged on order lock.
+- `users.credit` — per-user credit wallet (`numeric`, default 0), the balance charged on order/shipment
+  lock.
 - `OrgFee` → `org_fees` — per-org flat fee, composite PK `(org_id_fk, fee_type)`, `amount >= 0`;
-  `fee_type` is `CHECK`-constrained (`ORDER_LOCK` | `SHIPMENT_REQUEST`). No row = fee 0.
+  `fee_type` is `CHECK`-constrained (`ORDER_LOCK` | `SHIPMENT_LOCK`). No row = fee 0.
 - `CreditHistory` → `credit_history` — append-only credit ledger. `entry_type` `CHECK`-constrained
-  (`ORDER_LOCK` | `SHIPMENT_REQUEST` | `TOP_UP` | `ADJUSTMENT`); **signed** `amount` with
-  `prev_balance`/`new_balance` snapshots; nullable `order_id_fk` (→ `orders`, `on delete set null`)
-  links a charge to its order. Indexed by `(user_id_fk, created_at desc, id desc)` and
-  `(org_id_fk, created_at desc, id desc)` for the two ledger read paths, plus `order_id_fk`.
+  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `TOP_UP` | `ADJUSTMENT`); **signed** `amount` with
+  `prev_balance`/`new_balance` snapshots; nullable `order_id_fk` (→ `orders`) and nullable
+  `shipment_id_fk` (→ `shipments`), both `on delete set null`, linking a charge to what triggered it.
+  Indexed by `(user_id_fk, created_at desc, id desc)` and `(org_id_fk, created_at desc, id desc)` for
+  the two ledger read paths, plus `order_id_fk` and `shipment_id_fk`.
 
 Note: Postgres `numeric` columns come back as strings from TypeORM — the `Order`/`OrderHistory` qty
-columns, `users.credit`, `org_fees.amount`, and the `credit_history` amount/balance columns all use
+columns (including `orders.shipped_qty`), the `shipment_details`/`ShipmentHistory` qty columns,
+`users.credit`, `org_fees.amount`, and the `credit_history` amount/balance columns all use
 `numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
 
 Composite-key join entities map the raw uuid columns with `@PrimaryColumn` and layer the `@ManyToOne`

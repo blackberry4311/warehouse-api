@@ -46,6 +46,15 @@ export class Order {
   qty: number;
 
   /**
+   * How much of `qty` has been shipped back out via locked shipments. Starts at 0
+   * and is incremented (per line) when a shipment is locked; `qty - shipped_qty` is
+   * the quantity still available to ship. When it reaches `qty` the order is moved
+   * to COMPLETED. `qty` itself stays the immutable ordered total.
+   */
+  @Column({ type: 'numeric', name: 'shipped_qty', default: 0, transformer: numericTransformer })
+  shippedQty: number;
+
+  /**
    * Free-text tracking reference (typically a URL) the client supplies at
    * placement, pointing at the external carrier's system for the shipping /
    * arriving progress. Required — goods always move through an external shipper.

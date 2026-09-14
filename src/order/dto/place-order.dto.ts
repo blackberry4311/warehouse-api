@@ -23,6 +23,17 @@ export class PlaceOrderDto {
   qty: number;
 
   /**
+   * Optional human-readable order number supplied by the FE for a **manual**
+   * order. When present it is used verbatim (must be unique per org); when omitted
+   * the number is auto-generated as `<user code>-<6-digit seq>`.
+   */
+  @IsOptional()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(64)
+  orderNumber?: string;
+
+  /**
    * Free-text tracking reference (typically a carrier URL) for the shipment.
    * Required: the goods always move through an external shipper, so the client
    * always has one to supply at placement.

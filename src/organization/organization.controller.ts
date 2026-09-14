@@ -27,7 +27,7 @@ import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
 
 // Access control is enforced globally by PermissionsGuard via API_PERMISSION_MAP
-// (see src/auth/permissions.config.ts) — no per-route guards/decorators here.
+// (see src/rbac/permissions.config.ts) — no per-route guards/decorators here.
 @Controller('organizations')
 export class OrganizationController {
   constructor(private readonly orgService: OrganizationService) {}

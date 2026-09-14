@@ -12,8 +12,8 @@ import { Repository } from 'typeorm';
 import { FastifyRequest } from 'fastify';
 import { User } from '../../entities/user.entity';
 import { AuthenticatedUser } from '../../auth/interfaces/jwt-payload.interface';
-import { API_PERMISSION_MAP } from '../../auth/permissions.config';
-import { OrganizationService } from '../organization.service';
+import { API_PERMISSION_MAP } from '../permissions.config';
+import { OrganizationService } from '../../organization/organization.service';
 
 /**
  * Global guard driven by `API_PERMISSION_MAP`. For each request it looks up

@@ -91,10 +91,12 @@ export class OrderService {
   ) {}
 
   /**
-   * Place a new order into `dto.orgId` as the calling client. Generates a
-   * per-(user, org) order number, creates the order as SHIPPING (goods en route
-   * by cargo ship), and writes a CREATED history row — all in one transaction so
-   * the number is never a duplicate and an order always has an opening history entry.
+   * Place a new order into `dto.orgId` as the calling client. The order number is
+   * either supplied by the FE (`dto.orderNumber`, a manual order — used verbatim)
+   * or auto-generated as a per-(user, org) `<user code>-<6-digit seq>`. Creates the
+   * order as SHIPPING (goods en route by cargo ship) and writes a CREATED history
+   * row — all in one transaction so the number is never a duplicate and an order
+   * always has an opening history entry.
    */
   async placeOrder(userId: string, dto: PlaceOrderDto) {
     const orgId = dto.orgId;
@@ -102,26 +104,33 @@ export class OrderService {
     await this.orgService.assertOrgMembership(orgId, userId);
 
     return this.orderRepo.manager.transaction(async (em) => {
-      // Ensure the placing user has a client code (self-registered users may not).
-      const user = await em.findOne(User, { where: { id: userId } });
-      if (!user) throw new NotFoundException('User not found');
-      let code = user.code;
-      if (!code) {
-        code = await this.orgService.resolveUserCode(undefined, user.displayName ?? user.email);
-        await em.update(User, { id: userId }, { code });
-      }
+      let orderNumber: string;
+      const manualNumber = dto.orderNumber?.trim();
+      if (manualNumber) {
+        // Manual order: store the FE-supplied number verbatim, no validation.
+        orderNumber = manualNumber;
+      } else {
+        // Auto-generated: ensure the placing user has a client code (self-registered
+        // users may not), then atomically bump the per-(user, org) counter.
+        const user = await em.findOne(User, { where: { id: userId } });
+        if (!user) throw new NotFoundException('User not found');
+        let code = user.code;
+        if (!code) {
+          code = await this.orgService.resolveUserCode(undefined, user.displayName ?? user.email);
+          await em.update(User, { id: userId }, { code });
+        }
 
-      // Atomically bump the per-(user, org) counter.
-      const rows: Array<{ next_seq: string }> = await em.query(
-        `INSERT INTO wh.order_sequences (user_id_fk, org_id_fk, next_seq)
-         VALUES ($1, $2, 1)
-         ON CONFLICT (user_id_fk, org_id_fk)
-           DO UPDATE SET next_seq = order_sequences.next_seq + 1
-         RETURNING next_seq`,
-        [userId, orgId],
-      );
-      const seq = Number(rows[0].next_seq);
-      const orderNumber = `${code}-${String(seq).padStart(6, '0')}`;
+        const rows: Array<{ next_seq: string }> = await em.query(
+          `INSERT INTO wh.order_sequences (user_id_fk, org_id_fk, next_seq)
+           VALUES ($1, $2, 1)
+           ON CONFLICT (user_id_fk, org_id_fk)
+             DO UPDATE SET next_seq = order_sequences.next_seq + 1
+           RETURNING next_seq`,
+          [userId, orgId],
+        );
+        const seq = Number(rows[0].next_seq);
+        orderNumber = `${code}-${String(seq).padStart(6, '0')}`;
+      }
 
       const status = dto.status ?? OrderStatus.SHIPPING;
       const order = await em.save(

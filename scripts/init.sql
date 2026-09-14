@@ -136,6 +136,10 @@ create table orders
         references users
             on update cascade,
     qty          numeric                                                           not null,
+    -- How much of qty has been shipped back out via locked shipments. qty stays the
+    -- immutable ordered total; qty - shipped_qty is what is still available to ship.
+    -- When shipped_qty reaches qty the order is moved to COMPLETED.
+    shipped_qty  numeric                     default 0                             not null,
     tracking     text                                                              not null,
     status       varchar(50)                 default 'SHIPPING'::character varying not null
         constraint orders_status_check
@@ -145,9 +149,6 @@ create table orders
     created_at   timestamp(3) with time zone default now()                         not null,
     updated_at   timestamp with time zone
 );
-
-create unique index orders_number_unique
-    on orders (org_id_fk, order_number);
 
 create index orders_org_created_idx
     on orders (org_id_fk asc, created_at desc, id desc);
@@ -195,6 +196,98 @@ create table order_history
 create index order_history_order_created_idx
     on order_history (order_id_fk, created_at, id);
 
+-- A shipment: a client's request to withdraw some quantity out of one or more of
+-- their warehoused orders. The per-order quantities live on shipment_details. The
+-- mirror of `orders`: same review-lock gate (locking charges the SHIPMENT_LOCK
+-- fee and deducts the shipped qty from each order), same audit trail, same numbering.
+create table shipments
+(
+    id              uuid                        default gen_random_uuid()               not null
+        primary key,
+    shipment_number varchar(255)                                                        not null,
+    org_id_fk       uuid                                                                not null
+        references organizations
+            on update cascade on delete cascade,
+    user_id_fk      uuid                                                                not null
+        references users
+            on update cascade,
+    status          varchar(50)                 default 'REQUESTED'::character varying  not null
+        constraint shipments_status_check
+            check ((status)::text = ANY
+                   ((ARRAY ['REQUESTED'::character varying, 'DELIVERED'::character varying, 'CANCELLED'::character varying])::text[])),
+    locked          boolean                     default false                           not null,
+    tracking        text,
+    created_at      timestamp(3) with time zone default now()                           not null,
+    updated_at      timestamp with time zone
+);
+
+create index shipments_org_created_idx
+    on shipments (org_id_fk asc, created_at desc, id desc);
+
+create index shipments_org_locked_created_idx
+    on shipments (org_id_fk asc, locked asc, created_at desc, id desc);
+
+create index shipments_user_id_idx
+    on shipments (user_id_fk);
+
+-- Shipment detail lines: the many-to-many between a shipment and the orders it
+-- draws from, carrying the qty shipped out of each order in that shipment. Composite
+-- PK => each order appears at most once per shipment.
+create table shipment_details
+(
+    shipment_id_fk uuid    not null
+        references shipments
+            on update cascade on delete cascade,
+    order_id_fk    uuid    not null
+        references orders
+            on update cascade on delete cascade,
+    qty            numeric not null,
+    primary key (shipment_id_fk, order_id_fk)
+);
+
+create index shipment_details_order_id_idx
+    on shipment_details (order_id_fk);
+
+-- Append-only audit trail for a shipment (the mirror of order_history). prev_qty /
+-- new_qty hold the shipment's total quantity (summed across its order lines).
+create table shipment_history
+(
+    id             uuid                        default gen_random_uuid() not null
+        primary key,
+    shipment_id_fk uuid                                                  not null
+        references shipments
+            on update cascade on delete cascade,
+    changed_by_fk  uuid                                                  not null
+        references users
+            on update cascade,
+    change_type    varchar(50)                                           not null
+        constraint shipment_history_change_type_check
+            check ((change_type)::text = ANY
+                   ((ARRAY ['CREATED'::character varying, 'STATUS_CHANGE'::character varying, 'ITEM_CHANGE'::character varying, 'LOCKED'::character varying])::text[])),
+    prev_status    varchar(50),
+    new_status     varchar(50),
+    prev_qty       numeric,
+    new_qty        numeric,
+    note           text,
+    created_at     timestamp(3) with time zone default now()             not null
+);
+
+create index shipment_history_shipment_created_idx
+    on shipment_history (shipment_id_fk, created_at, id);
+
+-- Per-(user, org) shipment-number counter (the mirror of order_sequences).
+create table shipment_sequences
+(
+    user_id_fk uuid             not null
+        references users
+            on update cascade on delete cascade,
+    org_id_fk  uuid             not null
+        references organizations
+            on update cascade on delete cascade,
+    next_seq   bigint default 0 not null,
+    primary key (user_id_fk, org_id_fk)
+);
+
 -- Per-organization, flat fee catalog. One row per (org, fee_type): the predefined
 -- amount charged for that action in that org. `fee_type` is open-ended so the same
 -- table serves the order-lock fee today and the upcoming shipment-request fee.
@@ -208,7 +301,7 @@ create table org_fees
     fee_type   varchar(50)                            not null
         constraint org_fees_fee_type_check
             check ((fee_type)::text = ANY
-                   ((ARRAY ['ORDER_LOCK'::character varying, 'SHIPMENT_REQUEST'::character varying])::text[])),
+                   ((ARRAY ['ORDER_LOCK'::character varying, 'SHIPMENT_LOCK'::character varying])::text[])),
     amount     numeric                                not null
         constraint org_fees_amount_non_negative check (amount >= 0),
     created_at timestamp with time zone default now() not null,
@@ -221,7 +314,7 @@ create table org_fees
 -- new_balance = prev_balance + amount always holds. `order_id_fk` links a charge
 -- to the order that triggered it (a future shipment_request flow will add its own
 -- nullable reference the same way). Warehouse earnings for an org over a period =
--- -SUM(amount) WHERE entry_type IN ('ORDER_LOCK', 'SHIPMENT_REQUEST').
+-- -SUM(amount) WHERE entry_type IN ('ORDER_LOCK', 'SHIPMENT_LOCK').
 create table credit_history
 (
     id           uuid                        default gen_random_uuid() not null
@@ -235,12 +328,17 @@ create table credit_history
     entry_type   varchar(50)                                           not null
         constraint credit_history_entry_type_check
             check ((entry_type)::text = ANY
-                   ((ARRAY ['ORDER_LOCK'::character varying, 'SHIPMENT_REQUEST'::character varying, 'TOP_UP'::character varying, 'ADJUSTMENT'::character varying])::text[])),
+                   ((ARRAY ['ORDER_LOCK'::character varying, 'SHIPMENT_LOCK'::character varying, 'TOP_UP'::character varying, 'ADJUSTMENT'::character varying])::text[])),
     amount       numeric                                               not null,
     prev_balance numeric                                               not null,
     new_balance  numeric                                               not null,
     order_id_fk  uuid
                                                                        references orders
+                                                                           on update cascade on delete set null,
+    -- Links a SHIPMENT_LOCK charge to the shipment that triggered it (the mirror
+    -- of order_id_fk for the order-lock charge). Null for all other entry types.
+    shipment_id_fk uuid
+                                                                       references shipments
                                                                            on update cascade on delete set null,
     note         text,
     created_at   timestamp(3) with time zone default now()             not null
@@ -254,6 +352,9 @@ create index credit_history_org_created_idx
 
 create index credit_history_order_id_idx
     on credit_history (order_id_fk);
+
+create index credit_history_shipment_id_idx
+    on credit_history (shipment_id_fk);
 
 INSERT INTO wh.permissions (id, name, description, is_group_permission)
 VALUES ('21646332-064e-42bf-9e62-aa2e86b94179', 'manage_organizations', 'Create organizations', false);
@@ -291,3 +392,11 @@ VALUES ('edd30295-4d66-4c06-aaa8-b75c42975a68', 'manage_order', 'Manage orders: 
 INSERT INTO wh.permissions (id, name, description, is_group_permission)
 VALUES ('354632fd-3a28-4604-b85f-7863c93eee66', 'review_order', 'Review and lock orders, handing them to operations',
         true);
+INSERT INTO wh.permissions (id, name, description, is_group_permission)
+VALUES ('a1e6f2c4-0b7d-4d2a-9c3e-1f5b8a9d0c11', 'place_shipment', 'Request shipments against warehoused orders', true);
+INSERT INTO wh.permissions (id, name, description, is_group_permission)
+VALUES ('b2f7a3d5-1c8e-4e3b-8d4f-2a6c9b0e1d22', 'manage_shipment', 'Manage locked shipments: mark delivered or cancelled',
+        true);
+INSERT INTO wh.permissions (id, name, description, is_group_permission)
+VALUES ('c3a8b4e6-2d9f-4f4c-9e5a-3b7d0c1f2e33', 'review_shipment',
+        'Review and lock shipments, handing them to operations', true);
