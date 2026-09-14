@@ -391,7 +391,7 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
 **Three access levels for a route:**
 - **Permission-gated** — add the `"<method> <path>"` route to that permission's array in
   `PERMISSION_API_MAP` (creating the permission key if new, and inserting that permission name into
-  `wh.permissions`). No guard/controller code changes.
+  `wh.permissions` with a `category`). No guard/controller code changes.
 - **Authenticated-only** (any logged-in user, no specific permission, e.g. `GET /organizations/me`) —
   leave it out of the map and put `@UseGuards(JwtAccessGuard)` on the route. The global guard treats
   unlisted routes as public and passes through; `JwtAccessGuard` then enforces auth and sets `req.user`.
@@ -417,7 +417,13 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 - `Organization` → `organizations` — top-level tenant.
 - `UserOrg` → `users_orgs` — user ↔ org membership (composite PK `user_id_fk, org_id_fk`).
 - `OrgGroup` → `org_groups` — named groups (roles) scoped to an org (`name` unique per org).
-- `Permission` → `permissions` — global permission catalog (`name` unique).
+- `Permission` → `permissions` — global permission catalog (`name` unique). `category`
+  (`CHECK`-constrained: `order` | `shipment` | `organization` | `access_control`) groups each
+  permission by functional area so the FE can render the catalog grouped — a fixed, developer-authored
+  taxonomy mirroring the module layout, not a runtime-managed entity. The stored values are plain
+  lowercase tokens the FE title-cases for display (`access_control` → "Access Control"). `PermissionCategory`
+  enum lives on the entity; `listPermissions` orders by `(category, name)`, and `createPermission`
+  (`POST /organizations/permissions/catalog`) requires a `category`.
 - `UserGroup` → `user_groups` — user ↔ group assignment (composite PK `user_id_fk, group_id_fk`).
 - `GroupPermission` → `group_permissions` — group ↔ permission grants (composite PK
   `group_id_fk, permission_id_fk`).

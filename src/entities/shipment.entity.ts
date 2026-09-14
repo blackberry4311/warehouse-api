@@ -81,6 +81,15 @@ export class Shipment {
   @OneToMany(() => ShipmentDetail, (item) => item.shipment)
   items: ShipmentDetail[];
 
+  /**
+   * Non-persisted, list-only summary of `items`: how many orders this shipment
+   * draws from and their combined qty. Populated by `listShipments` (which does
+   * not load the full line set) so the UI can show them without a per-row fetch;
+   * `undefined` on single-shipment reads, which carry the full `items` instead.
+   */
+  orderCount?: number;
+  totalQty?: number;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;
 

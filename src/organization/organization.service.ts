@@ -170,12 +170,19 @@ export class OrganizationService {
     const existing = await this.permissionRepo.findOne({ where: { name: dto.name } });
     if (existing) throw new ConflictException('Permission already exists');
     return this.permissionRepo.save(
-      this.permissionRepo.create({ name: dto.name, description: dto.description }),
+      this.permissionRepo.create({
+        name: dto.name,
+        description: dto.description,
+        category: dto.category,
+      }),
     );
   }
 
   listPermissions() {
-    return this.permissionRepo.find({ where: { isGroupPermission: true }, order: { name: 'ASC' } });
+    return this.permissionRepo.find({
+      where: { isGroupPermission: true },
+      order: { category: 'ASC', name: 'ASC' },
+    });
   }
 
   // --- Group <-> permission grants ----------------------------------------

@@ -262,7 +262,35 @@ export class ShipmentService {
       });
     }
 
-    return toPage(await qb.getMany(), limit);
+    const page = toPage(await qb.getMany(), limit);
+    await this.attachItemSummary(page.items);
+    return page;
+  }
+
+  /**
+   * Populate each shipment's list-only `orderCount` / `totalQty` (how many orders it
+   * draws from and their combined qty) in a single grouped query over the paginated
+   * slice, so the list UI gets them without loading every line set.
+   */
+  private async attachItemSummary(shipments: Shipment[]): Promise<void> {
+    if (shipments.length === 0) return;
+    const ids = shipments.map((s) => s.id);
+    const rows: Array<{ shipmentId: string; orderCount: string; totalQty: string }> =
+      await this.shipmentRepo.manager
+        .createQueryBuilder(ShipmentDetail, 'd')
+        .select('d.shipmentId', 'shipmentId')
+        .addSelect('COUNT(*)', 'orderCount')
+        .addSelect('COALESCE(SUM(d.qty), 0)', 'totalQty')
+        .where('d.shipmentId IN (:...ids)', { ids })
+        .groupBy('d.shipmentId')
+        .getRawMany();
+
+    const summary = new Map(rows.map((r) => [r.shipmentId, r]));
+    for (const s of shipments) {
+      const row = summary.get(s.id);
+      s.orderCount = row ? Number(row.orderCount) : 0;
+      s.totalQty = row ? Number(row.totalQty) : 0;
+    }
   }
 
   /**

@@ -1,4 +1,5 @@
-import { IsString, MaxLength, MinLength } from 'class-validator';
+import { IsEnum, IsString, MaxLength, MinLength } from 'class-validator';
+import { PermissionCategory } from '../../entities/permission.entity';
 
 export class CreatePermissionDto {
   @IsString()
@@ -9,4 +10,7 @@ export class CreatePermissionDto {
   @IsString()
   @MinLength(1)
   description: string;
+
+  @IsEnum(PermissionCategory)
+  category: PermissionCategory;
 }
