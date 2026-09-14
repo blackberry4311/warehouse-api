@@ -9,13 +9,21 @@ async function bootstrap() {
     new FastifyAdapter({ logger: true }),
   );
 
+  // Comma-separated allowlist, e.g. "https://app.example.com,http://localhost:3000".
+  // Defaults to the local FE dev origin.
+  const corsOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3000')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
   app.enableCors({
-    origin: 'http://localhost:3000',
+    origin: corsOrigins,
     credentials: true,
   });
 
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }));
-  await app.listen(process.env.PORT ?? 3003, '0.0.0.0');
+  // Bind IPv6 dual-stack (`::`): required for Railway private networking (IPv6-only),
+  // and still serves the public edge proxy over IPv4. Override with HOST if needed.
+  await app.listen(process.env.PORT ?? 3003, process.env.HOST ?? '::');
 }
 
 bootstrap();
