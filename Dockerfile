@@ -50,8 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY package.json yarn.lock ./
 
-RUN --mount=type=cache,id=yarn,target=/usr/local/share/.cache/yarn \
-    yarn install --frozen-lockfile --production
+RUN yarn install --frozen-lockfile --production
 
 # ============================================
 # Stage 4: Production runner
