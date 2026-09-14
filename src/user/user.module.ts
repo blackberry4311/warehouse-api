@@ -4,9 +4,10 @@ import { UserController } from './user.controller';
 import { UserService } from './user.service';
 import { User } from '../entities/user.entity';
 import { CreditHistory } from '../entities/credit-history.entity';
+import { UserOrg } from '../entities/user-org.entity';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([User, CreditHistory])],
+  imports: [TypeOrmModule.forFeature([User, CreditHistory, UserOrg])],
   controllers: [UserController],
   providers: [UserService],
 })

@@ -15,11 +15,7 @@ import { PermissionsGuard } from './guards/permissions.guard';
  * graph stays acyclic: Rbac -> Organization -> Auth.
  */
 @Module({
-  imports: [
-    JwtModule.register({}),
-    TypeOrmModule.forFeature([User]),
-    OrganizationModule,
-  ],
+  imports: [JwtModule.register({}), TypeOrmModule.forFeature([User]), OrganizationModule],
   providers: [{ provide: APP_GUARD, useClass: PermissionsGuard }],
 })
 export class RbacModule {}

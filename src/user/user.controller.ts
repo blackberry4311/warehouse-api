@@ -20,6 +20,21 @@ import { UpdateProfileDto } from './dto/update-profile.dto';
 export class UserController {
   constructor(private readonly userService: UserService) {}
 
+  // The global user directory (non-admins only), each row carrying the orgs the
+  // user belongs to. Unlike the /me routes, this one IS permission-gated: it is
+  // listed in PERMISSION_API_MAP under `manage_all_users`, so the global
+  // PermissionsGuard requires that permission (admins bypass) before the
+  // controller-level JwtAccessGuard runs. Cursor-paginated; optional ?search=
+  // over email/displayName/code.
+  @Get()
+  listUsers(
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.userService.listUsers(limit, cursor, search);
+  }
+
   @Get('me')
   getMyProfile(@CurrentUser() user: AuthenticatedUser) {
     return this.userService.getProfile(user.userId);

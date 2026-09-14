@@ -21,6 +21,10 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   // Users
   add_user: ['post /organizations/users', 'patch /organizations/users/:userId'],
 
+  // Manage the global user directory: list every (non-admin) user in the system,
+  // to find an existing account and (re-)assign it to an org. Not org-scoped.
+  manage_all_users: ['get /users'],
+
   // Organizations
   manage_organizations: [
     'post /organizations',

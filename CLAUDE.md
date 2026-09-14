@@ -46,8 +46,25 @@ first spec for it.
 Requires Postgres with a `wh` schema — see `scripts/init.sql` for the full DDL. Run it manually
 against a fresh DB: there is no migration runner wired up, and `synchronize: false` in
 `TypeOrmModule.forRootAsync` (`app.module.ts`) means TypeORM will never auto-create or alter tables.
-**`scripts/init.sql` is the source of truth for the schema** — any entity change needs a matching
-manual SQL change applied to the running database.
+`scripts/init.sql` is the full-schema bootstrap for a **fresh** DB. It is **not** kept in lockstep
+with each change — it may lag behind the latest migrations and is reconciled back to current state by
+hand when needed.
+
+**Every change to the schema or to seed/reference data MUST ship a migration script** — no schema or
+data change is complete without one, and the migration (not `init.sql`) is what you write for the
+change. This covers any change to a table, column, index, constraint, enum/`CHECK`, or to seeded rows
+(e.g. `wh.permissions`, `wh.org_fees`), whether it originates from an entity change in `src/entities/`
+or from a hand-written SQL tweak. For each such change:
+1. Add a new migration file under `scripts/migrations/`, named `NNNN-short-description.sql` with a
+   zero-padded sequence number one higher than the last (e.g. `0001-add-orders-shipped-qty.sql`), so
+   files apply in filename order. Each migration is **forward-only** and **idempotent** where
+   practical (`IF NOT EXISTS` / `IF EXISTS`, guarded inserts), holding only the incremental DDL/DML
+   for that one change against the `wh` schema.
+2. Apply the migration by hand to any already-running database (there is no runner).
+
+Do **not** edit `scripts/init.sql` as part of the change — leave it as-is; it gets reconciled to the
+accumulated migrations separately, later. So a schema/data change touches two things: the entity/code
+and a new `scripts/migrations/NNNN-*.sql`.
 
 Required env vars (see `.env.sample`):
 - `DATABASE_URL` — Postgres connection string. Note: the sample value still points at a DB named
@@ -99,12 +116,16 @@ class-validator decorators and unknown properties are rejected.
   credit charge **and** the stock deduction on lock (it adds each line's qty to the order's
   `shipped_qty` and writes `order_history` for any order it completes, all in the lock transaction).
   Shares the keyset pagination helper.
-- `UserModule` (`src/user/`) — self-service for the authenticated user: read/update their own profile
-  and review their own wallet (`/users/me*`). Standalone module (its own `UserService` over
-  `forFeature([User, CreditHistory])`); it does **not** depend on `OrganizationModule`. Every route is
-  authenticated-only (`@UseGuards(JwtAccessGuard)` on the controller, left out of `PERMISSION_API_MAP`)
-  and scoped to the caller's own id, so there is no permission or cross-user check to enforce. Reuses
-  the shared keyset pagination helper for the credit ledger.
+- `UserModule` (`src/user/`) — self-service for the authenticated user (read/update their own profile
+  and review their own wallet, `/users/me*`), **plus** one administrator route: the global user
+  directory `GET /users`. Standalone module (its own `UserService` over
+  `forFeature([User, CreditHistory, UserOrg])` — `UserOrg` is read to attach each listed user's org
+  memberships); it does **not** depend on `OrganizationModule`. The `/me*` routes are authenticated-only
+  (`@UseGuards(JwtAccessGuard)` on the controller, left out of `PERMISSION_API_MAP`) and scoped to the
+  caller's own id; `GET /users` is the exception — it is listed in `PERMISSION_API_MAP` under
+  `manage_all_users`, so the global `PermissionsGuard` gates it (admins bypass) before the
+  controller-level `JwtAccessGuard` runs. Reuses the shared keyset pagination helper for both the credit
+  ledger and the directory.
 
 ### Organization / RBAC endpoints (`OrganizationController`, prefix `organizations`)
 - Me: `GET /organizations/me` — the caller's access tree
@@ -340,14 +361,26 @@ endpoint); there is no separate module.
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
   (`ORDER_LOCK`, `SHIPMENT_LOCK`) in `credit_history` — top-ups (positive) are excluded.
 
-### User self-service endpoints (`UserController`, prefix `users`)
-Self-service for the **authenticated caller**, scoped entirely to `/me` — every action targets the
+### User endpoints (`UserController`, prefix `users`)
+Mostly self-service for the **authenticated caller**, scoped to `/me` — every `/me` action targets the
 id resolved from the access token, so there is no target-user param and no permission/cross-user
-check. All routes are **authenticated-only**: `@UseGuards(JwtAccessGuard)` on the controller, and
+check. The `/me` routes are **authenticated-only**: `@UseGuards(JwtAccessGuard)` on the controller, and
 deliberately **not** in `PERMISSION_API_MAP` (the global `PermissionsGuard` treats unlisted routes as
 public and passes through; `JwtAccessGuard` then enforces auth and sets `req.user`). Contrast with the
 admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the manager's org-scoped
 `GET /organizations/:orgId/members/:userId/credit`.
+- `GET /users` — **administrator** route (the one non-`/me` route here): the global user directory for
+  finding an existing account to (re-)assign to an org — e.g. re-adding a user removed from one, for
+  which there is otherwise no lookup once they drop off an org's member list. Gated by the
+  `manage_all_users` permission (in `PERMISSION_API_MAP`; admins bypass), so the global guard authorizes
+  it before the controller's `JwtAccessGuard` re-checks auth. Excludes system admins; safe columns only
+  (never `password_hash`). Returns `{ items, nextCursor }` keyset-paginated by `(created_at, id)` newest
+  first (`limit`/`cursor`), with optional `?search=` matching email / display name / client `code`
+  (case-insensitive). Each item is `{ id, email, displayName, code, createdAt, organizations }` where
+  `organizations` is `[{ id, name }]` — the orgs the user currently belongs to (read from `users_orgs`
+  in one extra batched query), so the FE can render membership and offer the right add/remove actions.
+  Assigning a listed user to an org is then the existing `POST /organizations/:orgId/members`
+  (`manage_org_members`), which 409s if they are already a member.
 - `GET /users/me` — the caller's own profile: `{ id, email, displayName, code, isAdmin, credit,
   createdAt, updatedAt }`. Safe columns only — never `password_hash`.
 - `PATCH /users/me` — update the caller's own profile. Body `UpdateProfileDto` (`displayName`,
@@ -360,7 +393,12 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
   opposed to `OrganizationService.getMemberCredit`, which scopes the ledger to a single org.
 
 `UserModule` adds no new entities or tables — it reads/writes existing `users` columns and reads
-`credit_history`, so `scripts/init.sql` is unchanged.
+`credit_history` and `users_orgs`. It does ship two migrations, though: `manage_all_users` is a new
+seeded permission (`scripts/migrations/0002-seed-manage-all-users-permission.sql`), and `GET /users`
+keyset-paginates on `users.created_at`, which was narrowed to `timestamp(3)` so the cursor round-trips
+exactly (`scripts/migrations/0001-users-created-at-ms-precision.sql`) — the same reason the order /
+credit-history `created_at` columns are `timestamp(3)`. `scripts/init.sql` is left untouched (reconciled
+later), per **Environment / running locally**.
 
 ### Authorization: map-driven global guard
 - **`src/rbac/permissions.config.ts` — `PERMISSION_API_MAP`** is the authored source of truth. It maps
@@ -391,7 +429,9 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
 **Three access levels for a route:**
 - **Permission-gated** — add the `"<method> <path>"` route to that permission's array in
   `PERMISSION_API_MAP` (creating the permission key if new, and inserting that permission name into
-  `wh.permissions` with a `category`). No guard/controller code changes.
+  `wh.permissions` with a `category`). No guard/controller code changes. Seeding a new permission row
+  is a data change, so it needs a `scripts/migrations/NNNN-*.sql` like any other schema/data change
+  (`init.sql` is left untouched).
 - **Authenticated-only** (any logged-in user, no specific permission, e.g. `GET /organizations/me`) —
   leave it out of the map and put `@UseGuards(JwtAccessGuard)` on the route. The global guard treats
   unlisted routes as public and passes through; `JwtAccessGuard` then enforces auth and sets `req.user`.
@@ -491,4 +531,8 @@ a permission).
   table uses a plain `user_id`. Match the surrounding table when adding columns.
 - Composite join tables use a real composite `primary key`, not just a unique index.
 - When adding an RBAC feature: create the entity, register it in `AppModule` (`entities` array +
-  `forFeature`), add a feature module, and apply the matching SQL to the DB by hand.
+  `forFeature`), add a feature module, and — per **Environment / running locally** — add a matching
+  `scripts/migrations/NNNN-*.sql` and apply it to the running DB by hand (don't touch `init.sql`).
+- **Any schema or seed/reference-data change requires a migration script** (`scripts/migrations/NNNN-*.sql`);
+  `scripts/init.sql` is left untouched and reconciled later — see **Environment / running locally** for
+  the full rule.

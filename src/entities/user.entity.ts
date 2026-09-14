@@ -38,7 +38,9 @@ export class User {
   @Column({ type: 'numeric', default: 0, transformer: numericTransformer })
   credit: number;
 
-  @CreateDateColumn({ type: 'timestamptz', name: 'created_at' })
+  // precision: 3 (timestamp(3)) so it can back the user-directory keyset
+  // pagination — see scripts/migrations/0001-users-created-at-ms-precision.sql.
+  @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;
 
   @UpdateDateColumn({ type: 'timestamptz', name: 'updated_at' })
