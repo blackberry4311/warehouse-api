@@ -34,7 +34,7 @@ export class OrderController {
     @CurrentUser() actor: AuthenticatedUser,
     @Param('orderId', ParseUUIDPipe) orderId: string,
   ) {
-    return this.orderService.getOrder(actor.userId, orderId);
+    return this.orderService.getOrderDetail(actor.userId, orderId);
   }
 
   @Patch(':orderId')

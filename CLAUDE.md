@@ -118,9 +118,10 @@ class-validator decorators and unknown properties are rejected.
   credit charge **and** the stock deduction on lock (it adds each line's qty to the order's
   `shipped_qty` and writes `order_history` for any order it completes, all in the lock transaction).
   Shares the keyset pagination helper.
-- `ExtraFeeModule` (`src/extra-fee/`) — ad-hoc **extra fees** on an individual order or shipment.
+- `ExtraFeeModule` (`src/extra-fee/`) — the **fee** layer on an individual order or shipment, over the
+  unified `total_fees` table (`TotalFee` entity): the protected **lock fee** plus ad-hoc **extra fees**.
   Standalone module (its own `ExtraFeeService`, two controllers `OrderFeeController` /
-  `ShipmentFeeController`, over `forFeature([ExtraFee, Order, Shipment])`); imports `OrganizationModule`
+  `ShipmentFeeController`, over `forFeature([TotalFee, Order, Shipment])`); imports `OrganizationModule`
   only to reuse `OrganizationService` (membership + `hasOrgPermission`). One service serves both flows
   via an internal `FeeTarget` abstraction — the order and shipment routes are structurally identical.
   `CreditHistory` / `User` writes go through the shared transaction `EntityManager`. Shares the keyset
@@ -201,7 +202,9 @@ outside their scope, so they can't probe which orders exist. `listOrders` also a
   (`orgId` required query param), newest first; scoped per the roles above. Optional `?status=`,
   `?search=`, `?locked=` filters. Cursor-paginated (see below).
 - `GET /orders/:orderId` (`place_order` | `review_order` | `process_order`) — one order; org derived
-  from the order. Scoped per the roles above.
+  from the order. Scoped per the roles above. The response also carries `totalFee` — the sum of every
+  non-voided fee on the order (the protected lock fee plus active extra fees), so the FE can show the
+  running cost (`OrderService.getOrderDetail`).
 - `PATCH /orders/:orderId` — edit `qty`. Body `UpdateOrderDto` (`qty`, optional `note`); writes a
   `QTY_CHANGE` row. Shared route, actor resolved by the lock gate: while **unlocked** only the owner
   (`place_order`) may edit, and only while `SHIPPING`/`ARRIVING`; while **locked** only a reviewer
@@ -294,7 +297,9 @@ The read routes (`GET /shipments`, `GET /shipments/:shipmentId`, `GET /shipments
 are reachable by any of the three; `ShipmentService` applies the same own/all/locked-only scoping and
 `404`-on-out-of-scope as orders. `GET /shipments` takes a required `?orgId=`, optional `?status=`,
 `?search=` (shipment number), `?locked=`, and keyset `limit`/`cursor`. `GET /shipments/:shipmentId`
-returns the shipment with its `items` (each carrying the referenced order's number/qty/status).
+returns the shipment with its `items` (each carrying the referenced order's number/qty/status), plus
+`totalFee` — the sum of every non-voided fee on it (lock fee + active extra fees), for the FE's running
+cost (`ShipmentService.getShipmentDetail`).
 
 **Status lifecycle** (`ShipmentStatus` enum + DB `CHECK`): `REQUESTED → DELIVERED`, with `CANCELLED`
 reachable from `REQUESTED`; `DELIVERED`/`CANCELLED` are terminal. Split by the lock gate in
@@ -328,30 +333,38 @@ moves nothing (nothing was deducted).
 `process_shipment`) are seeded in `scripts/init.sql` and mapped in `PERMISSION_API_MAP`; grant them to
 groups exactly as the order permissions.
 
-### Extra fees (`OrderFeeController` / `ShipmentFeeController`, under `orders` / `shipments`)
-Ad-hoc, **named** fees operations staff add against a single order or shipment (e.g. "Repackaging",
-"Storage overage") — distinct from the predefined flat lock fees in `org_fees`. One table
-(`wh.extra_fees`) serves **both** flows: a row carries exactly one of `order_id_fk` / `shipment_id_fk`
-(a `CHECK` enforces it), mirroring how `credit_history` carries both. All logic lives in
-`ExtraFeeService`, which normalizes the order/shipment into an internal `FeeTarget` so one set of
-create/list/void routines handles both.
+### Fees (`OrderFeeController` / `ShipmentFeeController`, under `orders` / `shipments`)
+Every fee charged against a single order or shipment lives in **one** table (`wh.total_fees`,
+`TotalFee` entity), of two kinds distinguished by `is_protected`:
+- the **lock fee** (`is_protected = true`) — written automatically when the order/shipment is locked,
+  for the org's flat `ORDER_LOCK` / `SHIPMENT_LOCK` amount (see **Credit / billing**). Exactly one per
+  target, and it **cannot be voided**.
+- ad-hoc, **named** extra fees (`is_protected = false`) operations staff add (e.g. "Repackaging",
+  "Storage overage"). These **can** be voided.
+
+A row carries exactly one of `order_id_fk` / `shipment_id_fk` (a `CHECK` enforces it), mirroring how
+`credit_history` carries both. All logic lives in `ExtraFeeService`, which normalizes the order/shipment
+into an internal `FeeTarget` so one set of create/list/void routines handles both.
 
 - `POST /orders/:orderId/fees` (`review_order` | `process_order`) and
-  `POST /shipments/:shipmentId/fees` (`review_shipment` | `process_shipment`) — add a fee. Body
-  `CreateExtraFeeDto` (`name`, `amount > 0`, optional `note`). Allowed only while the target is
-  **locked and non-terminal** (400 otherwise). **Saving is the billing event**: in one transaction the
-  target's **client** (`order.userId` / `shipment.userId`, not the acting staffer) is charged — the
-  client's row `SELECT … FOR UPDATE`d, `400` on insufficient credit, deducted — and the `extra_fees` row
-  plus a signed-negative `EXTRA_FEE` `credit_history` row (linked via `extra_fee_id_fk` and the target's
-  `order_id_fk`/`shipment_id_fk`) are written.
+  `POST /shipments/:shipmentId/fees` (`review_shipment` | `process_shipment`) — add an **extra** fee
+  (`is_protected = false`). Body `CreateExtraFeeDto` (`name`, `amount > 0`, optional `note`). Allowed
+  only while the target is **locked and non-terminal** (400 otherwise). **Saving is the billing event**:
+  in one transaction the target's **client** (`order.userId` / `shipment.userId`, not the acting
+  staffer) is charged — the client's row `SELECT … FOR UPDATE`d, `400` on insufficient credit, deducted
+  — and the `total_fees` row plus a signed-negative `EXTRA_FEE` `credit_history` row (linked via
+  `fee_id_fk` and the target's `order_id_fk`/`shipment_id_fk`) are written.
 - `GET /orders/:orderId/fees` (`place_order` | `review_order` | `process_order`) and the shipment mirror
-  — list a target's fees, newest first, cursor-paginated. Same own/all/locked row-level scoping as the
-  order/shipment reads (so a client can see the fees they were charged; 404 when the target isn't
-  visible). Each row joins `createdByUser` / `voidedByUser` (safe columns only).
+  — list **all** of a target's fees (the protected lock fee and every extra fee, in one query), newest
+  first, cursor-paginated. Same own/all/locked row-level scoping as the order/shipment reads (so a client
+  can see the fees they were charged; 404 when the target isn't visible). Each row joins `createdByUser`
+  / `voidedByUser` (safe columns only) and carries `isProtected` so the FE knows the lock fee isn't
+  voidable.
 - `DELETE /orders/:orderId/fees/:feeId` (`review_order` | `process_order`) and the shipment mirror —
-  **void** a fee (staff only). The row is **immutable**: voiding stamps `voided_at`/`voided_by_fk` and
-  writes a **reversing** `EXTRA_FEE` (positive `amount`) ledger row that refunds the client, keeping the
-  ledger append-only and earnings self-netting. `400` if already voided.
+  **void** an extra fee (staff only). `400` if the fee is **protected** (the lock fee) or already voided.
+  The row is **immutable**: voiding stamps `voided_at`/`voided_by_fk` and writes a **reversing**
+  `EXTRA_FEE` (positive `amount`) ledger row that refunds the client, keeping the ledger append-only and
+  earnings self-netting.
 
 Auth/permissions come from the global `PermissionsGuard` via `PERMISSION_API_MAP` (the routes are mapped
 to the existing order/shipment role permissions); `ExtraFeeService` then re-checks org membership and the
@@ -372,13 +385,16 @@ endpoint); there is no separate module.
   `feeType`, `amount ≥ 0`). These routes are **not** in `PERMISSION_API_MAP` — they use
   `@UseGuards(JwtAccessGuard)` and `OrganizationService.setOrgFee`/`listOrgFees` enforce `is_admin`.
 - **The charge (order lock).** `OrderService.lockOrder` resolves the org's `ORDER_LOCK` fee and, in the
-  **same transaction** as the lock + `LOCKED` history row, charges the order's **client**
-  (`order.userId`, not the acting reviewer): it `SELECT … FOR UPDATE`s the client's row (so concurrent
-  charges/top-ups can't overdraw), throws `400` if `credit < fee`, deducts, and writes an `ORDER_LOCK`
-  ledger row. A fee of 0 charges nothing and writes no ledger row.
+  **same transaction** as the lock + `LOCKED` history row, always writes a **protected** `total_fees`
+  row (`is_protected = true`, name "Order lock fee", the fee amount — even when 0), then charges the
+  order's **client** (`order.userId`, not the acting reviewer): it `SELECT … FOR UPDATE`s the client's
+  row (so concurrent charges/top-ups can't overdraw), throws `400` if `credit < fee`, deducts, and
+  writes an `ORDER_LOCK` ledger row linked to the fee row via `fee_id_fk`. A fee of 0 charges nothing
+  and writes no ledger row, but the protected `total_fees` row (amount 0) is still recorded.
 - **The charge (shipment lock).** `ShipmentService.lockShipment` charges the shipment's **client** the
-  org's `SHIPMENT_LOCK` fee identically, writing a `SHIPMENT_LOCK` ledger row linked via
-  `credit_history.shipment_id_fk` (rather than `order_id_fk`). See the **Shipment system** above.
+  org's `SHIPMENT_LOCK` fee identically — a protected "Shipment lock fee" `total_fees` row plus (when
+  the fee > 0) a `SHIPMENT_LOCK` ledger row linked via `credit_history.shipment_id_fk` (rather than
+  `order_id_fk`). See the **Shipment system** above.
 - **Top-ups.** `POST /organizations/:orgId/members/:userId/credit` (`TopUpCreditDto`: `amount > 0`,
   optional `note`) adds funds and writes a `TOP_UP` ledger row, in a `FOR UPDATE` transaction. Gated by
   **`manage_org_members`** (whoever manages members manages their top-ups); the acting user must belong
@@ -393,14 +409,15 @@ endpoint); there is no separate module.
 - **Extra fees.** Beyond the flat lock fees, staff add **ad-hoc, named fees** against an individual
   order or shipment (`ExtraFeeService`), charged to the client the same way — a `FOR UPDATE`/
   insufficient-credit (`400`)/deduct transaction that writes an `EXTRA_FEE` ledger row linked via
-  `credit_history.extra_fee_id_fk`. See the dedicated **Extra fees** section above.
+  `credit_history.fee_id_fk`. Both the lock fee and extra fees share the `total_fees` table. See the
+  dedicated **Fees** section above.
 - **The ledger** (`credit_history`). One row per change: `entry_type`
   (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT`), a **signed** `amount`
   (negative = a charge, positive = top-up/refund/void) so `new_balance = prev_balance + amount` always
   holds, a nullable `order_id_fk` (set on an `ORDER_LOCK` charge or an order extra fee) **and** a nullable
   `shipment_id_fk` (set on a `SHIPMENT_LOCK` charge or a shipment extra fee) **and** a nullable
-  `extra_fee_id_fk` (set on an `EXTRA_FEE` charge/void) linking a movement to what triggered it, and the
-  `org_id_fk` the movement happened in.
+  `fee_id_fk` (→ `total_fees`, set on a lock-fee or `EXTRA_FEE` charge/void) linking a movement to what
+  triggered it, and the `org_id_fk` the movement happened in.
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
   (`ORDER_LOCK`, `SHIPMENT_LOCK`, `EXTRA_FEE`) in `credit_history` — top-ups (positive) are excluded, and
   because an extra-fee void is a positive `EXTRA_FEE` reversal it nets its original charge back out.
@@ -496,7 +513,7 @@ Postgres schema is `wh` (not `public`); table/column names are snake_case. `scri
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
 `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `Shipment`, `ShipmentDetail`,
-`ShipmentHistory`, `ShipmentSequence`, `ExtraFee`.
+`ShipmentHistory`, `ShipmentSequence`, `TotalFee`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -554,20 +571,21 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 - `CreditHistory` → `credit_history` — append-only credit ledger. `entry_type` `CHECK`-constrained
   (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT`); **signed** `amount` with
   `prev_balance`/`new_balance` snapshots; nullable `order_id_fk` (→ `orders`), nullable
-  `shipment_id_fk` (→ `shipments`), and nullable `extra_fee_id_fk` (→ `extra_fees`), all `on delete set
+  `shipment_id_fk` (→ `shipments`), and nullable `fee_id_fk` (→ `total_fees`), all `on delete set
   null`, linking a movement to what triggered it. Indexed by `(user_id_fk, created_at desc, id desc)` and
   `(org_id_fk, created_at desc, id desc)` for the two ledger read paths, plus `order_id_fk`,
-  `shipment_id_fk`, and `extra_fee_id_fk`.
-- `ExtraFee` → `extra_fees` — an ad-hoc named fee on one order **or** one shipment: `name`, `amount`
-  (`numeric`, `CHECK amount > 0`), `org_id_fk`, mutually-exclusive nullable `order_id_fk` /
+  `shipment_id_fk`, and `fee_id_fk`.
+- `TotalFee` → `total_fees` — every fee on one order **or** one shipment: `name`, `amount`
+  (`numeric`, `CHECK amount >= 0`), `is_protected` (`boolean`, default false — true = the non-voidable
+  lock fee, false = a voidable extra fee), `org_id_fk`, mutually-exclusive nullable `order_id_fk` /
   `shipment_id_fk` (`CHECK` exactly one set, both `on delete cascade`), `created_by_fk`, optional `note`,
   and `voided_at` / `voided_by_fk` (a void, never a delete). `created_by_fk` / `voided_by_fk` expose
   `createdByUser` / `voidedByUser` `@ManyToOne(User)` relations (safe columns only). Composite indexes
-  `extra_fees_order_created_idx` / `extra_fees_shipment_created_idx` back the per-target keyset lists.
+  `total_fees_order_created_idx` / `total_fees_shipment_created_idx` back the per-target keyset lists.
 
 Note: Postgres `numeric` columns come back as strings from TypeORM — the `Order`/`OrderHistory` qty
 columns (including `orders.shipped_qty`), the `shipment_details`/`ShipmentHistory` qty columns,
-`users.credit`, `org_fees.amount`, `extra_fees.amount`, and the `credit_history` amount/balance columns
+`users.credit`, `org_fees.amount`, `total_fees.amount`, and the `credit_history` amount/balance columns
 all use `numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
 
 Composite-key join entities map the raw uuid columns with `@PrimaryColumn` and layer the `@ManyToOne`

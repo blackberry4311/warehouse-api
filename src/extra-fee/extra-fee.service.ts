@@ -8,7 +8,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Order, OrderStatus } from '../entities/order.entity';
 import { Shipment, ShipmentStatus } from '../entities/shipment.entity';
-import { ExtraFee } from '../entities/extra-fee.entity';
+import { TotalFee } from '../entities/total-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
 import { User } from '../entities/user.entity';
 import { OrganizationService } from '../organization/organization.service';
@@ -22,7 +22,7 @@ const ORDER_TERMINAL: readonly OrderStatus[] = [OrderStatus.COMPLETED, OrderStat
  * A normalized view of the order/shipment a fee hangs off, so one set of
  * charge/list/void routines serves both flows. `perms` are the three role
  * permissions for the resource (client / reviewer / operations); `column` is the
- * `extra_fees` FK that points at this target.
+ * `total_fees` FK that points at this target.
  */
 interface FeeTarget {
   kind: 'order' | 'shipment';
@@ -47,7 +47,7 @@ interface FeeAccess {
 @Injectable()
 export class ExtraFeeService {
   constructor(
-    @InjectRepository(ExtraFee) private feeRepo: Repository<ExtraFee>,
+    @InjectRepository(TotalFee) private feeRepo: Repository<TotalFee>,
     @InjectRepository(Order) private orderRepo: Repository<Order>,
     @InjectRepository(Shipment) private shipmentRepo: Repository<Shipment>,
     private readonly orgService: OrganizationService,
@@ -159,9 +159,11 @@ export class ExtraFeeService {
       await em.update(User, { id: target.clientUserId }, { credit: newBalance });
 
       const fee = await em.save(
-        em.create(ExtraFee, {
+        em.create(TotalFee, {
           name: dto.name,
           amount: dto.amount,
+          // A staff-added extra fee — voidable, unlike the protected lock fee.
+          isProtected: false,
           orgId: target.orgId,
           orderId: target.column === 'orderId' ? target.id : null,
           shipmentId: target.column === 'shipmentId' ? target.id : null,
@@ -180,7 +182,7 @@ export class ExtraFeeService {
           newBalance,
           orderId: fee.orderId,
           shipmentId: fee.shipmentId,
-          extraFeeId: fee.id,
+          feeId: fee.id,
           note: dto.note ?? null,
         }),
       );
@@ -190,18 +192,22 @@ export class ExtraFeeService {
   }
 
   /**
-   * List a target's fees, newest first, keyset-paginated by (created_at, id).
-   * Same visibility as reading the order/shipment itself: a reviewer/admin sees
-   * all, operations sees fees on locked targets, and the client sees fees on their
-   * own — so a client can review what they were charged. 404 (not 403) when the
-   * caller can't see the target, so they can't probe which exist.
+   * List **every** fee charged against a target, newest first, keyset-paginated by
+   * (created_at, id). One table holds both kinds: the protected lock fee
+   * (`is_protected = true`, written at lock) and every ad-hoc extra fee
+   * (`is_protected = false`), so this is a single query with no read-time merge.
+   *
+   * Same visibility as reading the order/shipment itself: a reviewer/admin sees all,
+   * operations sees fees on locked targets, and the client sees fees on their own —
+   * so a client can review what they were charged. 404 (not 403) when the caller
+   * can't see the target, so they can't probe which exist.
    */
   private async listFees(
     actorId: string,
     target: FeeTarget,
     limitRaw?: string,
     cursor?: string,
-  ): Promise<Page<ExtraFee>> {
+  ): Promise<Page<TotalFee>> {
     await this.orgService.assertOrgMembership(target.orgId, actorId);
 
     const access = await this.resolveAccess(target, actorId);
@@ -218,16 +224,16 @@ export class ExtraFeeService {
       .addSelect(['cu.id', 'cu.displayName', 'cu.email', 'cu.code'])
       .leftJoin('fee.voidedByUser', 'vu')
       .addSelect(['vu.id', 'vu.displayName', 'vu.email', 'vu.code'])
-      .where(`fee.${target.column} = :id`, { id: target.id })
+      .where(`fee.${target.column} = :targetId`, { targetId: target.id })
       .orderBy('fee.createdAt', 'DESC')
       .addOrderBy('fee.id', 'DESC')
       .take(limit + 1);
 
     if (cursor) {
       const { t, id } = decodeCursor(cursor);
-      qb.andWhere('(fee.createdAt < :t OR (fee.createdAt = :t AND fee.id < :id))', {
+      qb.andWhere('(fee.createdAt < :t OR (fee.createdAt = :t AND fee.id < :curId))', {
         t: new Date(t),
-        id,
+        curId: id,
       });
     }
 
@@ -238,8 +244,8 @@ export class ExtraFeeService {
    * Void a fee: refund the client and stamp the row, in one transaction. The fee
    * row is immutable — voiding writes a reversing `EXTRA_FEE` (+amount) ledger row
    * rather than deleting anything, so the ledger stays append-only and per-org
-   * earnings net out. Only a reviewer or operations may void; an already-voided fee
-   * is a 400.
+   * earnings net out. Only a reviewer or operations may void; the protected lock
+   * fee (`is_protected`) can't be voided, and an already-voided fee is a 400.
    */
   private async voidFee(actorId: string, target: FeeTarget, feeId: string, note?: string) {
     await this.orgService.assertOrgMembership(target.orgId, actorId);
@@ -250,10 +256,11 @@ export class ExtraFeeService {
     }
 
     return this.feeRepo.manager.transaction(async (em) => {
-      const fee = await em.findOne(ExtraFee, {
+      const fee = await em.findOne(TotalFee, {
         where: { id: feeId, [target.column]: target.id },
       });
       if (!fee) throw new NotFoundException('Fee not found');
+      if (fee.isProtected) throw new BadRequestException('The lock fee cannot be voided');
       if (fee.voidedAt) throw new BadRequestException('Fee is already voided');
 
       const rows: Array<{ credit: string }> = await em.query(
@@ -280,7 +287,7 @@ export class ExtraFeeService {
           newBalance,
           orderId: fee.orderId,
           shipmentId: fee.shipmentId,
-          extraFeeId: fee.id,
+          feeId: fee.id,
           note: note ?? `Void of fee "${fee.name}"`,
         }),
       );

@@ -20,7 +20,7 @@ import { Shipment } from './entities/shipment.entity';
 import { ShipmentDetail } from './entities/shipment-detail.entity';
 import { ShipmentHistory } from './entities/shipment-history.entity';
 import { ShipmentSequence } from './entities/shipment-sequence.entity';
-import { ExtraFee } from './entities/extra-fee.entity';
+import { TotalFee } from './entities/total-fee.entity';
 import { AuthModule } from './auth/auth.module';
 import { OrganizationModule } from './organization/organization.module';
 import { RbacModule } from './rbac/rbac.module';
@@ -56,7 +56,7 @@ import { UserModule } from './user/user.module';
           ShipmentDetail,
           ShipmentHistory,
           ShipmentSequence,
-          ExtraFee,
+          TotalFee,
         ],
         synchronize: false,
       }),

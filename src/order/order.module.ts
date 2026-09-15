@@ -5,11 +5,12 @@ import { OrderService } from './order.service';
 import { Order } from '../entities/order.entity';
 import { OrderHistory } from '../entities/order-history.entity';
 import { User } from '../entities/user.entity';
+import { TotalFee } from '../entities/total-fee.entity';
 import { OrganizationModule } from '../organization/organization.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Order, OrderHistory, User]),
+    TypeOrmModule.forFeature([Order, OrderHistory, User, TotalFee]),
     // Reuse org validation / membership checks / client-code resolution.
     OrganizationModule,
   ],

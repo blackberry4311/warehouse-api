@@ -9,7 +9,7 @@ import {
 import { Organization } from './organization.entity';
 import { Order } from './order.entity';
 import { Shipment } from './shipment.entity';
-import { ExtraFee } from './extra-fee.entity';
+import { TotalFee } from './total-fee.entity';
 import { User } from './user.entity';
 import { numericTransformer } from './numeric.transformer';
 
@@ -24,9 +24,10 @@ export enum CreditEntryType {
   /** Charged when a reviewer locks the client's shipment. */
   SHIPMENT_LOCK = 'SHIPMENT_LOCK',
   /**
-   * An ad-hoc `extra_fees` line staff added against an order/shipment: negative on
-   * the charge, positive on a void (the reversal), so the EXTRA_FEE sum nets out.
-   * Linked back to the fee via `extra_fee_id_fk`.
+   * A `total_fees` line staff added against an order/shipment: negative on the
+   * charge, positive on a void (the reversal), so the EXTRA_FEE sum nets out.
+   * Linked back to the fee via `fee_id_fk`. (The flat lock fee also has a
+   * `total_fees` row but is booked under `ORDER_LOCK`/`SHIPMENT_LOCK`.)
    */
   EXTRA_FEE = 'EXTRA_FEE',
   /** The client added funds. */
@@ -76,9 +77,9 @@ export class CreditHistory {
   @Column({ type: 'uuid', name: 'shipment_id_fk', nullable: true })
   shipmentId: string | null;
 
-  /** The extra_fees row that triggered the movement, if any (an EXTRA_FEE charge/void). */
-  @Column({ type: 'uuid', name: 'extra_fee_id_fk', nullable: true })
-  extraFeeId: string | null;
+  /** The total_fees row that triggered the movement, if any (a lock or extra-fee charge/void). */
+  @Column({ type: 'uuid', name: 'fee_id_fk', nullable: true })
+  feeId: string | null;
 
   @Column({ type: 'text', nullable: true })
   note: string | null;
@@ -99,9 +100,9 @@ export class CreditHistory {
   @JoinColumn({ name: 'shipment_id_fk' })
   shipment: Shipment | null;
 
-  @ManyToOne(() => ExtraFee, { onDelete: 'SET NULL', onUpdate: 'CASCADE' })
-  @JoinColumn({ name: 'extra_fee_id_fk' })
-  extraFee: ExtraFee | null;
+  @ManyToOne(() => TotalFee, { onDelete: 'SET NULL', onUpdate: 'CASCADE' })
+  @JoinColumn({ name: 'fee_id_fk' })
+  fee: TotalFee | null;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;

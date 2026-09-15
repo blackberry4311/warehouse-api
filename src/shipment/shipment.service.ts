@@ -14,6 +14,7 @@ import { ShipmentChangeType, ShipmentHistory } from '../entities/shipment-histor
 import { User } from '../entities/user.entity';
 import { FeeType, OrgFee } from '../entities/org-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
+import { TotalFee } from '../entities/total-fee.entity';
 import { OrganizationService } from '../organization/organization.service';
 import { PlaceShipmentDto } from './dto/place-shipment.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
@@ -72,6 +73,7 @@ export class ShipmentService {
   constructor(
     @InjectRepository(Shipment) private shipmentRepo: Repository<Shipment>,
     @InjectRepository(ShipmentHistory) private historyRepo: Repository<ShipmentHistory>,
+    @InjectRepository(TotalFee) private feeRepo: Repository<TotalFee>,
     private readonly orgService: OrganizationService,
   ) {}
 
@@ -322,6 +324,29 @@ export class ShipmentService {
   }
 
   /**
+   * The shipment-detail read for the FE: the shipment (with its line items) plus
+   * `totalFee`, the running total the client is charged — the sum of every non-voided
+   * fee on it (the protected lock fee plus any active extra fees; voided fees are
+   * refunded so excluded). Wraps {@link getShipment} for the same auth/scoping.
+   */
+  async getShipmentDetail(userId: string, shipmentId: string) {
+    const shipment = await this.getShipment(userId, shipmentId);
+    const totalFee = await this.sumFees(shipment.id);
+    return { ...shipment, totalFee };
+  }
+
+  /** Sum of the non-voided fees charged against a shipment (0 when there are none). */
+  private async sumFees(shipmentId: string): Promise<number> {
+    const raw = await this.feeRepo
+      .createQueryBuilder('fee')
+      .select('COALESCE(SUM(fee.amount), 0)', 'sum')
+      .where('fee.shipmentId = :shipmentId', { shipmentId })
+      .andWhere('fee.voidedAt IS NULL')
+      .getRawOne<{ sum: string }>();
+    return parseFloat(raw?.sum ?? '0');
+  }
+
+  /**
    * Edit an unlocked (REQUESTED) shipment's line items and/or tracking. Only the
    * owning client may edit, and only before a reviewer locks it. Supplying `items`
    * replaces the entire line set. Records an ITEM_CHANGE history row.
@@ -411,6 +436,21 @@ export class ShipmentService {
       });
       const fee = feeRow?.amount ?? 0;
 
+      // Always record the lock fee as a protected (non-voidable) row, so it shows up
+      // in the shipment's fee list alongside any extra fees — even when it is 0.
+      const lockFee = await em.save(
+        em.create(TotalFee, {
+          name: 'Shipment lock fee',
+          amount: fee,
+          isProtected: true,
+          orgId: shipment.orgId,
+          orderId: null,
+          shipmentId: shipment.id,
+          createdBy: userId,
+          note: dto.note ?? null,
+        }),
+      );
+
       if (fee > 0) {
         const rows: Array<{ credit: string }> = await em.query(
           `SELECT credit FROM wh.users WHERE id = $1 FOR UPDATE`,
@@ -435,6 +475,7 @@ export class ShipmentService {
             prevBalance,
             newBalance,
             shipmentId: shipment.id,
+            feeId: lockFee.id,
             note: dto.note ?? null,
           }),
         );

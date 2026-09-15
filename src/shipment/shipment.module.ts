@@ -5,13 +5,15 @@ import { ShipmentService } from './shipment.service';
 import { Shipment } from '../entities/shipment.entity';
 import { ShipmentDetail } from '../entities/shipment-detail.entity';
 import { ShipmentHistory } from '../entities/shipment-history.entity';
+import { TotalFee } from '../entities/total-fee.entity';
 import { OrganizationModule } from '../organization/organization.module';
 
 @Module({
   imports: [
     // Order / OrderHistory writes (stock deduction on lock) go through the shared
     // transaction EntityManager, which already knows every globally-registered entity.
-    TypeOrmModule.forFeature([Shipment, ShipmentDetail, ShipmentHistory]),
+    // TotalFee is read to total up a shipment's fees for the detail view.
+    TypeOrmModule.forFeature([Shipment, ShipmentDetail, ShipmentHistory, TotalFee]),
     // Reuse org validation / membership checks / permission checks / code resolution.
     OrganizationModule,
   ],

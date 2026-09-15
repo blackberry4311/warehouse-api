@@ -11,6 +11,7 @@ import { OrderChangeType, OrderHistory } from '../entities/order-history.entity'
 import { User } from '../entities/user.entity';
 import { FeeType, OrgFee } from '../entities/org-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
+import { TotalFee } from '../entities/total-fee.entity';
 import { OrganizationService } from '../organization/organization.service';
 import { PlaceOrderDto } from './dto/place-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
@@ -87,6 +88,7 @@ export class OrderService {
   constructor(
     @InjectRepository(Order) private orderRepo: Repository<Order>,
     @InjectRepository(OrderHistory) private historyRepo: Repository<OrderHistory>,
+    @InjectRepository(TotalFee) private feeRepo: Repository<TotalFee>,
     private readonly orgService: OrganizationService,
   ) {}
 
@@ -262,6 +264,29 @@ export class OrderService {
   }
 
   /**
+   * The order-detail read for the FE: the order plus `totalFee`, the running total
+   * the client is charged — the sum of every non-voided fee on it (the protected
+   * lock fee plus any active extra fees; voided fees are refunded so excluded).
+   * Wraps {@link getOrder} for the same authorization/scoping.
+   */
+  async getOrderDetail(userId: string, orderId: string) {
+    const order = await this.getOrder(userId, orderId);
+    const totalFee = await this.sumFees(order.id);
+    return { ...order, totalFee };
+  }
+
+  /** Sum of the non-voided fees charged against an order (0 when there are none). */
+  private async sumFees(orderId: string): Promise<number> {
+    const raw = await this.feeRepo
+      .createQueryBuilder('fee')
+      .select('COALESCE(SUM(fee.amount), 0)', 'sum')
+      .where('fee.orderId = :orderId', { orderId })
+      .andWhere('fee.voidedAt IS NULL')
+      .getRawOne<{ sum: string }>();
+    return parseFloat(raw?.sum ?? '0');
+  }
+
+  /**
    * Edit an order's quantity, recording a QTY_CHANGE. Who may edit depends on the
    * lock gate:
    *   - while **unlocked**, only the owning client may edit, and only while the
@@ -329,8 +354,9 @@ export class OrderService {
    * the acting reviewer) is charged the org's flat `ORDER_LOCK` fee. The charge, the
    * lock, and both audit rows all happen in one transaction, and the client's row is
    * locked `FOR UPDATE` so concurrent charges can't overdraw. If the client's credit
-   * can't cover the fee the whole lock is rejected. An org with no configured fee is
-   * charged nothing (and no ledger row is written).
+   * can't cover the fee the whole lock is rejected. An org with no configured fee
+   * charges nothing, but a (protected, non-voidable) `total_fees` row is always
+   * written to record the lock fee — a zero amount when the org has none.
    */
   async lockOrder(userId: string, orderId: string, dto: LockOrderDto) {
     const order = await this.getOrder(userId, orderId);
@@ -349,6 +375,21 @@ export class OrderService {
         where: { orgId: order.orgId, feeType: FeeType.ORDER_LOCK },
       });
       const fee = feeRow?.amount ?? 0;
+
+      // Always record the lock fee as a protected (non-voidable) row, so it shows up
+      // in the order's fee list alongside any extra fees — even when it is 0.
+      const lockFee = await em.save(
+        em.create(TotalFee, {
+          name: 'Order lock fee',
+          amount: fee,
+          isProtected: true,
+          orgId: order.orgId,
+          orderId: order.id,
+          shipmentId: null,
+          createdBy: userId,
+          note: dto.note ?? null,
+        }),
+      );
 
       if (fee > 0) {
         // Lock the client's row so two concurrent locks can't both pass the check
@@ -376,6 +417,7 @@ export class OrderService {
             prevBalance,
             newBalance,
             orderId: order.id,
+            feeId: lockFee.id,
             note: dto.note ?? null,
           }),
         );

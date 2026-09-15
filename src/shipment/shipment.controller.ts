@@ -42,7 +42,7 @@ export class ShipmentController {
     @CurrentUser() actor: AuthenticatedUser,
     @Param('shipmentId', ParseUUIDPipe) shipmentId: string,
   ) {
-    return this.shipmentService.getShipment(actor.userId, shipmentId);
+    return this.shipmentService.getShipmentDetail(actor.userId, shipmentId);
   }
 
   @Patch(':shipmentId')
