@@ -29,7 +29,7 @@ const CLIENT_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
   [ShipmentStatus.CANCELLED]: [],
 };
 
-/** Status moves **operations** (manage_shipment) may make once the shipment is locked. */
+/** Status moves **operations** (process_shipment) may make once the shipment is locked. */
 const MANAGE_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
   [ShipmentStatus.REQUESTED]: [ShipmentStatus.DELIVERED, ShipmentStatus.CANCELLED],
   [ShipmentStatus.DELIVERED]: [],
@@ -61,7 +61,7 @@ function parseLocked(raw?: string): boolean | undefined {
 interface ShipmentAccess {
   /** review_shipment (or admin): sees every shipment in the org. */
   canReview: boolean;
-  /** manage_shipment: sees only locked shipments — the operations queue. */
+  /** process_shipment: sees only locked shipments — the operations queue. */
   canManage: boolean;
   /** place_shipment: sees only the shipments they placed. */
   canPlace: boolean;
@@ -198,7 +198,7 @@ export class ShipmentService {
   private async resolveAccess(orgId: string, userId: string): Promise<ShipmentAccess> {
     const [canReview, canManage, canPlace] = await Promise.all([
       this.orgService.hasOrgPermission(orgId, userId, 'review_shipment'),
-      this.orgService.hasOrgPermission(orgId, userId, 'manage_shipment'),
+      this.orgService.hasOrgPermission(orgId, userId, 'process_shipment'),
       this.orgService.hasOrgPermission(orgId, userId, 'place_shipment'),
     ]);
     return { canReview, canManage, canPlace };
@@ -505,7 +505,7 @@ export class ShipmentService {
    * Move a shipment's status, recording a STATUS_CHANGE. Split by the lock gate:
    *   - while **unlocked**, only the owning client may act — cancelling a REQUESTED
    *     shipment (nothing was deducted, so nothing is restored);
-   *   - once **locked**, only operations (`manage_shipment`) may act — marking it
+   *   - once **locked**, only operations (`process_shipment`) may act — marking it
    *     DELIVERED, or CANCELLED (which returns the shipped qty to its orders,
    *     reverting any order it had completed back to IN_WAREHOUSE). The fee is not
    *     refunded.

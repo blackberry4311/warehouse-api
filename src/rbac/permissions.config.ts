@@ -7,14 +7,14 @@
  * single route may be granted by more than one permission (the caller needs any
  * one of them) — e.g. the order read routes below are reachable by the client who
  * placed orders (`place_order`), a reviewer (`review_order`), and operations staff
- * (`manage_order`).
+ * (`process_order`).
  *
  * Any route NOT listed here is public. Edit this map to change access — no
  * decorators or redeploy of route code needed.
  *
  * Note: this only gates *reachability* of a route. Row-level scoping (a
  * `place_order` client sees only their own orders, `review_order` sees all, and
- * `manage_order` sees only locked orders) and the lock-gated split of the shared
+ * `process_order` sees only locked orders) and the lock-gated split of the shared
  * PATCH routes are enforced in `OrderService`, not here.
  */
 export const PERMISSION_API_MAP: Record<string, string[]> = {
@@ -79,7 +79,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   //   - `review_order` — a reviewer: reviews and locks orders (the client/ops
   //                      handoff), edits a *locked* order's qty (but NOT its
   //                      status), and reads *every* order in the org.
-  //   - `manage_order` — operations: drives a *locked* order's status along the
+  //   - `process_order` — operations: drives a *locked* order's status along the
   //                      warehouse lifecycle, and reads *every locked* order and
   //                      its history.
   //
@@ -102,7 +102,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'get /orders/:orderId',
     'get /orders/:orderId/history',
   ],
-  manage_order: [
+  process_order: [
     'patch /orders/:orderId/status',
     'get /orders',
     'get /orders/:orderId',
@@ -117,7 +117,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   //                         or cancels them; reads *their own* shipments and history.
   //   - `review_shipment` — a reviewer: reviews and locks shipments (the billing +
   //                         stock-deduction handoff), and reads *every* shipment.
-  //   - `manage_shipment` — operations: drives a *locked* shipment to DELIVERED /
+  //   - `process_shipment` — operations: drives a *locked* shipment to DELIVERED /
   //                         CANCELLED, and reads *every locked* shipment and history.
   place_shipment: [
     'post /shipments',
@@ -133,7 +133,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'get /shipments/:shipmentId',
     'get /shipments/:shipmentId/history',
   ],
-  manage_shipment: [
+  process_shipment: [
     'patch /shipments/:shipmentId/status',
     'get /shipments',
     'get /shipments/:shipmentId',

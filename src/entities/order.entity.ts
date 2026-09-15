@@ -68,7 +68,7 @@ export class Order {
   /**
    * Review gate. A reviewer (`review_order`) locks an order after placement:
    * while unlocked the client may still edit it; once locked the client is frozen
-   * out and operations (`manage_order`) can see and process it. Orthogonal to
+   * out and operations (`process_order`) can see and process it. Orthogonal to
    * `status` — an order stays in its pending state (SHIPPING/ARRIVING) when locked
    * until operations moves it into the warehouse.
    */

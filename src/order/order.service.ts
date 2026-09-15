@@ -32,7 +32,7 @@ const CLIENT_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 };
 
 /**
- * Status moves **operations** (manage_order) may make, once the order is locked:
+ * Status moves **operations** (process_order) may make, once the order is locked:
  * the warehouse lifecycle. A manager can push a locked order forward from either
  * pending state into the warehouse, then on to completion. CANCELLED is reachable
  * from any live state; COMPLETED and CANCELLED are terminal.
@@ -76,7 +76,7 @@ function parseLocked(raw?: string): boolean | undefined {
 interface OrderAccess {
   /** review_order (or admin): sees every order in the org. */
   canReview: boolean;
-  /** manage_order: sees only locked (reviewed) orders — the operations queue. */
+  /** process_order: sees only locked (reviewed) orders — the operations queue. */
   canManage: boolean;
   /** place_order: sees only the orders they placed. */
   canPlace: boolean;
@@ -166,7 +166,7 @@ export class OrderService {
   private async resolveAccess(orgId: string, userId: string): Promise<OrderAccess> {
     const [canReview, canManage, canPlace] = await Promise.all([
       this.orgService.hasOrgPermission(orgId, userId, 'review_order'),
-      this.orgService.hasOrgPermission(orgId, userId, 'manage_order'),
+      this.orgService.hasOrgPermission(orgId, userId, 'process_order'),
       this.orgService.hasOrgPermission(orgId, userId, 'place_order'),
     ]);
     return { canReview, canManage, canPlace };
@@ -203,7 +203,7 @@ export class OrderService {
 
     // Row-level scoping. Reviewers (and admins) see everything; otherwise the
     // caller sees the union of what their permissions grant — locked orders for
-    // operations (manage_order), their own orders for a client (place_order).
+    // operations (process_order), their own orders for a client (place_order).
     if (!access.canReview) {
       const scopes: string[] = [];
       if (access.canManage) scopes.push('order.locked = true');
@@ -242,7 +242,7 @@ export class OrderService {
   /**
    * Load an order and authorize the caller. They must belong to the order's org;
    * beyond that, a reviewer (review_order) and admins may read any order in the
-   * org, operations (manage_order) may read any *locked* order, and a client
+   * org, operations (process_order) may read any *locked* order, and a client
    * (place_order) may read only orders they placed.
    */
   async getOrder(userId: string, orderId: string) {
@@ -322,7 +322,7 @@ export class OrderService {
   /**
    * A reviewer (`review_order`) reviews and locks a freshly placed order, handing
    * it to operations. Locking freezes the client out of further edits and surfaces
-   * the order into the operations (manage_order) queue. Recorded as a LOCKED
+   * the order into the operations (process_order) queue. Recorded as a LOCKED
    * history row. Only a still-pending, not-yet-locked order can be locked.
    *
    * Locking is also the billing event: the order's **client** (`order.userId`, not
@@ -405,7 +405,7 @@ export class OrderService {
    *   - while **unlocked**, only the owning client may change status — reporting
    *     their shipment (SHIPPING ↔ ARRIVING) or cancelling (CLIENT_TRANSITIONS);
    *   - once **locked**, the client is frozen out and only operations
-   *     (`manage_order`) drives the warehouse lifecycle (MANAGE_TRANSITIONS).
+   *     (`process_order`) drives the warehouse lifecycle (MANAGE_TRANSITIONS).
    */
   async updateStatus(userId: string, orderId: string, dto: UpdateOrderStatusDto) {
     const order = await this.getOrder(userId, orderId);

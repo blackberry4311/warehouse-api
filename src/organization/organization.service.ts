@@ -91,7 +91,40 @@ export class OrganizationService {
 
   async listMembers(orgId: string) {
     await this.getOrganization(orgId);
-    return this.userOrgRepo.find({ where: { orgId }, relations: { user: true } });
+    const memberships = await this.userOrgRepo.find({
+      where: { orgId },
+      relations: { user: true },
+    });
+    if (memberships.length === 0) return memberships;
+
+    // Attach each member's groups (roles), scoped to this org, so the admin
+    // users table can show who sits in which group. Batched to avoid N+1: one
+    // query for the org's groups, one for the members' assignments to them.
+    const orgGroups = await this.groupRepo.find({ where: { orgId } });
+    const orgGroupById = new Map(orgGroups.map((g) => [g.id, g]));
+
+    const userGroups = orgGroups.length
+      ? await this.userGroupRepo.find({
+          where: {
+            userId: In(memberships.map((m) => m.userId)),
+            groupId: In(orgGroups.map((g) => g.id)),
+          },
+        })
+      : [];
+
+    const groupsByUser = new Map<string, { id: string; name: string }[]>();
+    for (const ug of userGroups) {
+      const group = orgGroupById.get(ug.groupId);
+      if (!group) continue;
+      const list = groupsByUser.get(ug.userId) ?? [];
+      list.push({ id: group.id, name: group.name });
+      groupsByUser.set(ug.userId, list);
+    }
+
+    return memberships.map((m) => ({
+      ...m,
+      groups: groupsByUser.get(m.userId) ?? [],
+    }));
   }
 
   async removeMember(orgId: string, userId: string) {
@@ -530,7 +563,7 @@ export class OrganizationService {
 
   /**
    * Whether the user effectively holds `permissionName` within `orgId`. System
-   * admins always do. Used for row-level scoping (e.g. `manage_order` staff see
+   * admins always do. Used for row-level scoping (e.g. `process_order` staff see
    * every order in the org, while a plain `place_order` client sees only theirs).
    */
   async hasOrgPermission(orgId: string, userId: string, permissionName: string): Promise<boolean> {

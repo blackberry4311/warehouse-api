@@ -56,7 +56,7 @@ export class Shipment {
    * (`review_shipment`) locks the shipment after placement. Locking freezes the
    * client out, charges the client's `SHIPMENT_LOCK` fee, deducts each line's
    * qty from its order (completing fully-shipped orders), and surfaces the shipment
-   * into the operations (`manage_shipment`) queue.
+   * into the operations (`process_shipment`) queue.
    */
   @Column({ type: 'boolean', default: false })
   locked: boolean;
