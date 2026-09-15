@@ -30,7 +30,7 @@ const CLIENT_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
 };
 
 /** Status moves **operations** (process_shipment) may make once the shipment is locked. */
-const MANAGE_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
+const PROCESS_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
   [ShipmentStatus.REQUESTED]: [ShipmentStatus.DELIVERED, ShipmentStatus.CANCELLED],
   [ShipmentStatus.DELIVERED]: [],
   [ShipmentStatus.CANCELLED]: [],
@@ -519,7 +519,7 @@ export class ShipmentService {
       if (!access.canManage) {
         throw new ForbiddenException('Shipment is locked; only operations can change its status');
       }
-      allowed = MANAGE_SHIPMENT_TRANSITIONS[shipment.status];
+      allowed = PROCESS_SHIPMENT_TRANSITIONS[shipment.status];
     } else {
       if (shipment.userId !== userId) {
         throw new ForbiddenException(

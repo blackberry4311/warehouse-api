@@ -87,6 +87,10 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   // OrderService by the lock gate: `patch /orders/:orderId/status` is the client's
   // pre-lock or operations' post-lock; `patch /orders/:orderId` is the owner's
   // pre-lock or the reviewer's post-lock.
+  //
+  // Extra fees (ad-hoc named charges on an order): only the two staff roles may add
+  // or void one; the placing client may also list them (to see what they were
+  // charged). ExtraFeeService applies the same own/all/locked scoping as the reads.
   place_order: [
     'post /orders',
     'patch /orders/:orderId',
@@ -94,6 +98,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'get /orders',
     'get /orders/:orderId',
     'get /orders/:orderId/history',
+    'get /orders/:orderId/fees',
   ],
   review_order: [
     'post /orders/:orderId/lock',
@@ -101,12 +106,18 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'get /orders',
     'get /orders/:orderId',
     'get /orders/:orderId/history',
+    'post /orders/:orderId/fees',
+    'get /orders/:orderId/fees',
+    'delete /orders/:orderId/fees/:feeId',
   ],
   process_order: [
     'patch /orders/:orderId/status',
     'get /orders',
     'get /orders/:orderId',
     'get /orders/:orderId/history',
+    'post /orders/:orderId/fees',
+    'get /orders/:orderId/fees',
+    'delete /orders/:orderId/fees/:feeId',
   ],
 
   // Shipments (outbound withdrawals of warehoused goods) — the mirror of orders.
@@ -126,18 +137,25 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'get /shipments',
     'get /shipments/:shipmentId',
     'get /shipments/:shipmentId/history',
+    'get /shipments/:shipmentId/fees',
   ],
   review_shipment: [
     'post /shipments/:shipmentId/lock',
     'get /shipments',
     'get /shipments/:shipmentId',
     'get /shipments/:shipmentId/history',
+    'post /shipments/:shipmentId/fees',
+    'get /shipments/:shipmentId/fees',
+    'delete /shipments/:shipmentId/fees/:feeId',
   ],
   process_shipment: [
     'patch /shipments/:shipmentId/status',
     'get /shipments',
     'get /shipments/:shipmentId',
     'get /shipments/:shipmentId/history',
+    'post /shipments/:shipmentId/fees',
+    'get /shipments/:shipmentId/fees',
+    'delete /shipments/:shipmentId/fees/:feeId',
   ],
 };
 

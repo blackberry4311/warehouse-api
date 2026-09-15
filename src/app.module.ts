@@ -20,11 +20,13 @@ import { Shipment } from './entities/shipment.entity';
 import { ShipmentDetail } from './entities/shipment-detail.entity';
 import { ShipmentHistory } from './entities/shipment-history.entity';
 import { ShipmentSequence } from './entities/shipment-sequence.entity';
+import { ExtraFee } from './entities/extra-fee.entity';
 import { AuthModule } from './auth/auth.module';
 import { OrganizationModule } from './organization/organization.module';
 import { RbacModule } from './rbac/rbac.module';
 import { OrderModule } from './order/order.module';
 import { ShipmentModule } from './shipment/shipment.module';
+import { ExtraFeeModule } from './extra-fee/extra-fee.module';
 import { UserModule } from './user/user.module';
 
 @Module({
@@ -54,6 +56,7 @@ import { UserModule } from './user/user.module';
           ShipmentDetail,
           ShipmentHistory,
           ShipmentSequence,
+          ExtraFee,
         ],
         synchronize: false,
       }),
@@ -64,6 +67,7 @@ import { UserModule } from './user/user.module';
     RbacModule,
     OrderModule,
     ShipmentModule,
+    ExtraFeeModule,
     UserModule,
   ],
   exports: [TypeOrmModule],

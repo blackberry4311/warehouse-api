@@ -10,9 +10,10 @@ groups/roles, and permissions), an **order system** (org-scoped orders with a st
 and an audit trail), a **shipment system** (org-scoped outbound shipments that draw quantity from
 one or more warehoused orders, mirroring the order flow — status lifecycle, review-lock gate, and
 audit trail), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
-order or a shipment is locked, with a full ledger), and a small **self-service layer** (the
-authenticated user reads/updates their own profile and reviews their own wallet), all over a
-Postgres database in the `wh` schema.
+order or a shipment is locked — plus ad-hoc, named **extra fees** staff add against an individual
+order or shipment — with a full ledger), and a small **self-service layer** (the authenticated user
+reads/updates their own profile and reviews their own wallet), all over a Postgres database in the
+`wh` schema.
 
 `@anthropic-ai/sdk` is listed as a dependency but is not yet used anywhere in `src/`.
 
@@ -83,7 +84,8 @@ class-validator decorators and unknown properties are rejected.
 - `AppModule` wires global `ConfigModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
-  `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, and `UserModule`.
+  `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, `ExtraFeeModule`, and
+  `UserModule`.
 - `AuthModule` — registration/login/refresh/logout. Uses `@nestjs/jwt`, `bcrypt` for password
   hashing, and two Passport JWT strategies:
   - `jwt-access` (Bearer header) — guards ordinary endpoints via `JwtAccessGuard`.
@@ -116,6 +118,13 @@ class-validator decorators and unknown properties are rejected.
   credit charge **and** the stock deduction on lock (it adds each line's qty to the order's
   `shipped_qty` and writes `order_history` for any order it completes, all in the lock transaction).
   Shares the keyset pagination helper.
+- `ExtraFeeModule` (`src/extra-fee/`) — ad-hoc **extra fees** on an individual order or shipment.
+  Standalone module (its own `ExtraFeeService`, two controllers `OrderFeeController` /
+  `ShipmentFeeController`, over `forFeature([ExtraFee, Order, Shipment])`); imports `OrganizationModule`
+  only to reuse `OrganizationService` (membership + `hasOrgPermission`). One service serves both flows
+  via an internal `FeeTarget` abstraction — the order and shipment routes are structurally identical.
+  `CreditHistory` / `User` writes go through the shared transaction `EntityManager`. Shares the keyset
+  pagination helper. See **Extra fees** below.
 - `UserModule` (`src/user/`) — self-service for the authenticated user (read/update their own profile
   and review their own wallet, `/users/me*`), **plus** one administrator route: the global user
   directory `GET /users`. Standalone module (its own `UserService` over
@@ -172,7 +181,7 @@ the client to operations (`orders.locked`; when and by whom it was locked are re
   `POST /orders/:orderId/lock`, edits a **locked** order's qty (but **not** its status), and reads
   **every order in the org**. Locking freezes the client out and surfaces the order into the operations
   queue. Only `review_order` can lock.
-- `manage_order` — **operations staff**: drives a **locked** order's status along the warehouse
+- `process_order` — **operations staff**: drives a **locked** order's status along the warehouse
   lifecycle, and reads **every *locked* order in the org** and its history.
 
 The three read routes (`GET /orders`, `GET /orders/:orderId`, `GET /orders/:orderId/history`) are
@@ -188,10 +197,10 @@ outside their scope, so they can't probe which orders exist. `listOrders` also a
 - `POST /orders` (`place_order`) — client places an order. Body `PlaceOrderDto` (`orgId`, `qty`,
   **required** `tracking` — a free-text carrier reference/URL, since goods always ship via an external
   system, optional `note`). Created as `SHIPPING`, unlocked.
-- `GET /orders?orgId=:orgId` (`place_order` | `review_order` | `manage_order`) — list an org's orders
+- `GET /orders?orgId=:orgId` (`place_order` | `review_order` | `process_order`) — list an org's orders
   (`orgId` required query param), newest first; scoped per the roles above. Optional `?status=`,
   `?search=`, `?locked=` filters. Cursor-paginated (see below).
-- `GET /orders/:orderId` (`place_order` | `review_order` | `manage_order`) — one order; org derived
+- `GET /orders/:orderId` (`place_order` | `review_order` | `process_order`) — one order; org derived
   from the order. Scoped per the roles above.
 - `PATCH /orders/:orderId` — edit `qty`. Body `UpdateOrderDto` (`qty`, optional `note`); writes a
   `QTY_CHANGE` row. Shared route, actor resolved by the lock gate: while **unlocked** only the owner
@@ -200,13 +209,13 @@ outside their scope, so they can't probe which orders exist. `listOrders` also a
 - `PATCH /orders/:orderId/status` — move the order's status. Body `UpdateOrderStatusDto` (`status`,
   optional `note`); writes a `STATUS_CHANGE` row. Shared route, actor resolved by the lock gate: while
   **unlocked** only the owner (`place_order`) may move it (`SHIPPING ↔ ARRIVING`, or cancel); while
-  **locked** only operations (`manage_order`) may move it (warehouse lifecycle).
+  **locked** only operations (`process_order`) may move it (warehouse lifecycle).
 - `POST /orders/:orderId/lock` (`review_order`) — reviewer reviews and locks a `SHIPPING`/`ARRIVING`
   order. Body `LockOrderDto` (optional `note`). Writes a `LOCKED` history row. 400 if already locked or
   past the pending states. **Locking is the billing event**: the order's *client* (`order.userId`, not
   the acting reviewer) is charged the org's `ORDER_LOCK` fee, and a 400 is returned if their credit
   can't cover it. See **Credit / billing** below.
-- `GET /orders/:orderId/history` (`place_order` | `review_order` | `manage_order`) — the order's audit trail, oldest
+- `GET /orders/:orderId/history` (`place_order` | `review_order` | `process_order`) — the order's audit trail, oldest
   first; same own-vs-all scoping as `GET /orders/:orderId`. Cursor-paginated (see below). Each row
   includes `changedByUser` (`{ id, displayName, email, code }`, joined on `changed_by_fk` — never
   `password_hash`) alongside the raw `changedBy` uuid, so the FE can render who made each change.
@@ -229,10 +238,10 @@ automatically — not by `updateStatus` — when shipments have shipped out all 
 moves are **split by the lock gate** into two tables in `OrderService`:
 - `CLIENT_TRANSITIONS` — what the owning client may do while **unlocked**: `SHIPPING ↔ ARRIVING`
   (report their shipment) and cancel. These are the two client-reported pending states.
-- `MANAGE_TRANSITIONS` — what operations may do once **locked**: push from either pending state into
+- `PROCESS_TRANSITIONS` — what operations may do once **locked**: push from either pending state into
   `IN_WAREHOUSE`, then on to `COMPLETED`, and cancel.
 
-`updateStatus` picks the table by `order.locked` and checks the actor (owner pre-lock, `manage_order`
+`updateStatus` picks the table by `order.locked` and checks the actor (owner pre-lock, `process_order`
 post-lock), so the client can never touch a locked order and operations can never touch an unlocked
 one. Locking is thus the handoff: a reviewer locks a `SHIPPING`/`ARRIVING` order, after which the
 warehouse lifecycle begins.
@@ -252,9 +261,9 @@ warehouse lifecycle begins.
   entry.
 
 **Adding order permissions to a group:** the three permissions (`place_order`, `review_order`,
-`manage_order`) are seeded in `scripts/init.sql`; grant them to groups via the existing
+`process_order`) are seeded in `scripts/init.sql`; grant them to groups via the existing
 group-permission endpoints — `place_order` to a client group (place/edit + read own orders),
-`review_order` to a Review group (review/lock + read all orders), `manage_order` to an Operations group
+`review_order` to a Review group (review/lock + read all orders), `process_order` to an Operations group
 (process + read all locked orders in the org).
 
 ### Shipment system (`ShipmentController`, prefix `shipments`)
@@ -278,7 +287,7 @@ client owns, in the shipment's org, that are `IN_WAREHOUSE` with enough **remain
 - `review_shipment` — a **reviewer**: reviews and **locks** a `REQUESTED` shipment
   (`POST /shipments/:shipmentId/lock`); reads **every** shipment in the org. Only `review_shipment` can
   lock. (There is no reviewer edit-after-lock, unlike orders — a locked shipment's lines are fixed.)
-- `manage_shipment` — **operations**: drives a **locked** shipment to `DELIVERED`/`CANCELLED`
+- `process_shipment` — **operations**: drives a **locked** shipment to `DELIVERED`/`CANCELLED`
   (`PATCH /shipments/:shipmentId/status`), and reads **every *locked*** shipment and its history.
 
 The read routes (`GET /shipments`, `GET /shipments/:shipmentId`, `GET /shipments/:shipmentId/history`)
@@ -289,7 +298,7 @@ returns the shipment with its `items` (each carrying the referenced order's numb
 
 **Status lifecycle** (`ShipmentStatus` enum + DB `CHECK`): `REQUESTED → DELIVERED`, with `CANCELLED`
 reachable from `REQUESTED`; `DELIVERED`/`CANCELLED` are terminal. Split by the lock gate in
-`ShipmentService` (`CLIENT_SHIPMENT_TRANSITIONS` / `MANAGE_SHIPMENT_TRANSITIONS`): while **unlocked**
+`ShipmentService` (`CLIENT_SHIPMENT_TRANSITIONS` / `PROCESS_SHIPMENT_TRANSITIONS`): while **unlocked**
 only the owning client may act (cancel a `REQUESTED` shipment); once **locked** only operations may act
 (`DELIVERED` or `CANCELLED`). Locking does **not** change `status` (it stays `REQUESTED`), exactly like
 orders.
@@ -316,8 +325,37 @@ moves nothing (nothing was deducted).
 `changedByUser` joined the same way.
 
 **Adding shipment permissions to a group:** the three permissions (`place_shipment`, `review_shipment`,
-`manage_shipment`) are seeded in `scripts/init.sql` and mapped in `PERMISSION_API_MAP`; grant them to
+`process_shipment`) are seeded in `scripts/init.sql` and mapped in `PERMISSION_API_MAP`; grant them to
 groups exactly as the order permissions.
+
+### Extra fees (`OrderFeeController` / `ShipmentFeeController`, under `orders` / `shipments`)
+Ad-hoc, **named** fees operations staff add against a single order or shipment (e.g. "Repackaging",
+"Storage overage") — distinct from the predefined flat lock fees in `org_fees`. One table
+(`wh.extra_fees`) serves **both** flows: a row carries exactly one of `order_id_fk` / `shipment_id_fk`
+(a `CHECK` enforces it), mirroring how `credit_history` carries both. All logic lives in
+`ExtraFeeService`, which normalizes the order/shipment into an internal `FeeTarget` so one set of
+create/list/void routines handles both.
+
+- `POST /orders/:orderId/fees` (`review_order` | `process_order`) and
+  `POST /shipments/:shipmentId/fees` (`review_shipment` | `process_shipment`) — add a fee. Body
+  `CreateExtraFeeDto` (`name`, `amount > 0`, optional `note`). Allowed only while the target is
+  **locked and non-terminal** (400 otherwise). **Saving is the billing event**: in one transaction the
+  target's **client** (`order.userId` / `shipment.userId`, not the acting staffer) is charged — the
+  client's row `SELECT … FOR UPDATE`d, `400` on insufficient credit, deducted — and the `extra_fees` row
+  plus a signed-negative `EXTRA_FEE` `credit_history` row (linked via `extra_fee_id_fk` and the target's
+  `order_id_fk`/`shipment_id_fk`) are written.
+- `GET /orders/:orderId/fees` (`place_order` | `review_order` | `process_order`) and the shipment mirror
+  — list a target's fees, newest first, cursor-paginated. Same own/all/locked row-level scoping as the
+  order/shipment reads (so a client can see the fees they were charged; 404 when the target isn't
+  visible). Each row joins `createdByUser` / `voidedByUser` (safe columns only).
+- `DELETE /orders/:orderId/fees/:feeId` (`review_order` | `process_order`) and the shipment mirror —
+  **void** a fee (staff only). The row is **immutable**: voiding stamps `voided_at`/`voided_by_fk` and
+  writes a **reversing** `EXTRA_FEE` (positive `amount`) ledger row that refunds the client, keeping the
+  ledger append-only and earnings self-netting. `400` if already voided.
+
+Auth/permissions come from the global `PermissionsGuard` via `PERMISSION_API_MAP` (the routes are mapped
+to the existing order/shipment role permissions); `ExtraFeeService` then re-checks org membership and the
+per-org role, so a permission held in one org can't act in another — like the order/shipment routes.
 
 ### Credit / billing
 A per-user **credit wallet** (`users.credit`) is charged when an order **or a shipment** is locked, with
@@ -352,14 +390,20 @@ endpoint); there is no separate module.
   the caller as **self, a system admin, or a `manage_org_members` holder** in the org. Each ledger row
   carries its own `prevBalance`/`newBalance` snapshot, so an org-filtered row stays self-consistent
   even though the wallet itself spans orgs.
+- **Extra fees.** Beyond the flat lock fees, staff add **ad-hoc, named fees** against an individual
+  order or shipment (`ExtraFeeService`), charged to the client the same way — a `FOR UPDATE`/
+  insufficient-credit (`400`)/deduct transaction that writes an `EXTRA_FEE` ledger row linked via
+  `credit_history.extra_fee_id_fk`. See the dedicated **Extra fees** section above.
 - **The ledger** (`credit_history`). One row per change: `entry_type`
-  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `TOP_UP` | `ADJUSTMENT`), a **signed** `amount` (negative = a
-  charge, positive = top-up/refund) so `new_balance = prev_balance + amount` always holds, a nullable
-  `order_id_fk` (set on an `ORDER_LOCK` charge) **and** a nullable `shipment_id_fk` (set on a
-  `SHIPMENT_LOCK` charge) linking a charge to what triggered it, and the `org_id_fk` the movement
-  happened in.
+  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT`), a **signed** `amount`
+  (negative = a charge, positive = top-up/refund/void) so `new_balance = prev_balance + amount` always
+  holds, a nullable `order_id_fk` (set on an `ORDER_LOCK` charge or an order extra fee) **and** a nullable
+  `shipment_id_fk` (set on a `SHIPMENT_LOCK` charge or a shipment extra fee) **and** a nullable
+  `extra_fee_id_fk` (set on an `EXTRA_FEE` charge/void) linking a movement to what triggered it, and the
+  `org_id_fk` the movement happened in.
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
-  (`ORDER_LOCK`, `SHIPMENT_LOCK`) in `credit_history` — top-ups (positive) are excluded.
+  (`ORDER_LOCK`, `SHIPMENT_LOCK`, `EXTRA_FEE`) in `credit_history` — top-ups (positive) are excluded, and
+  because an extra-fee void is a positive `EXTRA_FEE` reversal it nets its original charge back out.
 
 ### User endpoints (`UserController`, prefix `users`)
 Mostly self-service for the **authenticated caller**, scoped to `/me` — every `/me` action targets the
@@ -393,12 +437,13 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
   opposed to `OrganizationService.getMemberCredit`, which scopes the ledger to a single org.
 
 `UserModule` adds no new entities or tables — it reads/writes existing `users` columns and reads
-`credit_history` and `users_orgs`. It does ship two migrations, though: `manage_all_users` is a new
-seeded permission (`scripts/migrations/0002-seed-manage-all-users-permission.sql`), and `GET /users`
-keyset-paginates on `users.created_at`, which was narrowed to `timestamp(3)` so the cursor round-trips
-exactly (`scripts/migrations/0001-users-created-at-ms-precision.sql`) — the same reason the order /
-credit-history `created_at` columns are `timestamp(3)`. `scripts/init.sql` is left untouched (reconciled
-later), per **Environment / running locally**.
+`credit_history` and `users_orgs`. Its two schema/seed changes — the new seeded `manage_all_users`
+permission, and narrowing `users.created_at` to `timestamp(3)` so the `GET /users` keyset cursor
+round-trips exactly (the same reason the order / credit-history `created_at` columns are `timestamp(3)`)
+— shipped as migrations applied by hand to the running DB. Those files are **no longer in
+`scripts/migrations/`** (the current sequence restarts at `0001`) and are **not yet folded into
+`scripts/init.sql`** either, so a DB freshly bootstrapped from `init.sql` still lacks them; reconcile
+them into `init.sql` when it is next brought up to date, per **Environment / running locally**.
 
 ### Authorization: map-driven global guard
 - **`src/rbac/permissions.config.ts` — `PERMISSION_API_MAP`** is the authored source of truth. It maps
@@ -451,7 +496,7 @@ Postgres schema is `wh` (not `public`); table/column names are snake_case. `scri
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
 `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `Shipment`, `ShipmentDetail`,
-`ShipmentHistory`, `ShipmentSequence`.
+`ShipmentHistory`, `ShipmentSequence`, `ExtraFee`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -507,16 +552,23 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 - `OrgFee` → `org_fees` — per-org flat fee, composite PK `(org_id_fk, fee_type)`, `amount >= 0`;
   `fee_type` is `CHECK`-constrained (`ORDER_LOCK` | `SHIPMENT_LOCK`). No row = fee 0.
 - `CreditHistory` → `credit_history` — append-only credit ledger. `entry_type` `CHECK`-constrained
-  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `TOP_UP` | `ADJUSTMENT`); **signed** `amount` with
-  `prev_balance`/`new_balance` snapshots; nullable `order_id_fk` (→ `orders`) and nullable
-  `shipment_id_fk` (→ `shipments`), both `on delete set null`, linking a charge to what triggered it.
-  Indexed by `(user_id_fk, created_at desc, id desc)` and `(org_id_fk, created_at desc, id desc)` for
-  the two ledger read paths, plus `order_id_fk` and `shipment_id_fk`.
+  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT`); **signed** `amount` with
+  `prev_balance`/`new_balance` snapshots; nullable `order_id_fk` (→ `orders`), nullable
+  `shipment_id_fk` (→ `shipments`), and nullable `extra_fee_id_fk` (→ `extra_fees`), all `on delete set
+  null`, linking a movement to what triggered it. Indexed by `(user_id_fk, created_at desc, id desc)` and
+  `(org_id_fk, created_at desc, id desc)` for the two ledger read paths, plus `order_id_fk`,
+  `shipment_id_fk`, and `extra_fee_id_fk`.
+- `ExtraFee` → `extra_fees` — an ad-hoc named fee on one order **or** one shipment: `name`, `amount`
+  (`numeric`, `CHECK amount > 0`), `org_id_fk`, mutually-exclusive nullable `order_id_fk` /
+  `shipment_id_fk` (`CHECK` exactly one set, both `on delete cascade`), `created_by_fk`, optional `note`,
+  and `voided_at` / `voided_by_fk` (a void, never a delete). `created_by_fk` / `voided_by_fk` expose
+  `createdByUser` / `voidedByUser` `@ManyToOne(User)` relations (safe columns only). Composite indexes
+  `extra_fees_order_created_idx` / `extra_fees_shipment_created_idx` back the per-target keyset lists.
 
 Note: Postgres `numeric` columns come back as strings from TypeORM — the `Order`/`OrderHistory` qty
 columns (including `orders.shipped_qty`), the `shipment_details`/`ShipmentHistory` qty columns,
-`users.credit`, `org_fees.amount`, and the `credit_history` amount/balance columns all use
-`numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
+`users.credit`, `org_fees.amount`, `extra_fees.amount`, and the `credit_history` amount/balance columns
+all use `numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
 
 Composite-key join entities map the raw uuid columns with `@PrimaryColumn` and layer the `@ManyToOne`
 relation on the same column via `@JoinColumn` — follow that pattern for new junctions.

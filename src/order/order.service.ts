@@ -33,11 +33,11 @@ const CLIENT_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 
 /**
  * Status moves **operations** (process_order) may make, once the order is locked:
- * the warehouse lifecycle. A manager can push a locked order forward from either
+ * the warehouse lifecycle. Operations can push a locked order forward from either
  * pending state into the warehouse, then on to completion. CANCELLED is reachable
  * from any live state; COMPLETED and CANCELLED are terminal.
  */
-const MANAGE_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+const PROCESS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   [OrderStatus.SHIPPING]: [OrderStatus.ARRIVING, OrderStatus.IN_WAREHOUSE, OrderStatus.CANCELLED],
   [OrderStatus.ARRIVING]: [OrderStatus.IN_WAREHOUSE, OrderStatus.CANCELLED],
   [OrderStatus.IN_WAREHOUSE]: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
@@ -405,7 +405,7 @@ export class OrderService {
    *   - while **unlocked**, only the owning client may change status — reporting
    *     their shipment (SHIPPING ↔ ARRIVING) or cancelling (CLIENT_TRANSITIONS);
    *   - once **locked**, the client is frozen out and only operations
-   *     (`process_order`) drives the warehouse lifecycle (MANAGE_TRANSITIONS).
+   *     (`process_order`) drives the warehouse lifecycle (PROCESS_TRANSITIONS).
    */
   async updateStatus(userId: string, orderId: string, dto: UpdateOrderStatusDto) {
     const order = await this.getOrder(userId, orderId);
@@ -417,7 +417,7 @@ export class OrderService {
       if (!access.canManage) {
         throw new ForbiddenException('Order is locked; only operations can change its status');
       }
-      allowed = MANAGE_TRANSITIONS[order.status];
+      allowed = PROCESS_TRANSITIONS[order.status];
     } else {
       // Pre-lock: the client reports shipment progress or cancels.
       if (order.userId !== userId) {
