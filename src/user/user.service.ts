@@ -7,6 +7,7 @@ import { CreditHistory } from '../entities/credit-history.entity';
 import { UserOrg } from '../entities/user-org.entity';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { decodeCursor, parseLimit, toPage } from '../common/pagination.util';
+import { attachBillFlag } from '../common/credit-bill.util';
 
 /**
  * Self-service for the authenticated user: read/update their own profile and
@@ -127,6 +128,8 @@ export class UserService {
     const limit = parseLimit(limitRaw);
     const qb = this.creditHistoryRepo
       .createQueryBuilder('c')
+      .leftJoin('c.resource', 'resource')
+      .addSelect('resource.id')
       .where('c.userId = :userId', { userId })
       .orderBy('c.createdAt', 'DESC')
       .addOrderBy('c.id', 'DESC')
@@ -140,7 +143,7 @@ export class UserService {
       });
     }
 
-    const history = toPage(await qb.getMany(), limit);
+    const history = attachBillFlag(toPage(await qb.getMany(), limit));
     return { userId: user.id, credit: user.credit, history };
   }
 

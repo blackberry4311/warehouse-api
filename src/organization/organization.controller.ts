@@ -7,10 +7,14 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Put,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
+import type { FastifyRequest } from 'fastify';
 import { JwtAccessGuard } from '../auth/guards/jwt-access.guard';
+import { MAX_UPLOAD_BYTES, readSingleUploadedFile } from '../common/uploaded-file.util';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/interfaces/jwt-payload.interface';
 import { OrganizationService } from './organization.service';
@@ -25,6 +29,9 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
+
+/** Image/PDF types accepted for a top-up bill (receipt). */
+const BILL_ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
 
 // Access control is enforced globally by PermissionsGuard via API_PERMISSION_MAP
 // (see src/rbac/permissions.config.ts) — no per-route guards/decorators here.
@@ -159,6 +166,57 @@ export class OrganizationController {
     @Query('cursor') cursor?: string,
   ) {
     return this.orgService.getMemberCredit(actor.userId, orgId, userId, limit, cursor);
+  }
+
+  // Attach or replace the bill (receipt image) on a top-up. multipart/form-data,
+  // one file field. Only the image changes — the top-up info stays immutable.
+  // Gated by manage_org_members (see PERMISSION_API_MAP). Covers both "attach at
+  // top-up" (call POST .../credit, then this with the returned entryId) and later.
+  @Put(':orgId/members/:userId/credit/:entryId/bill')
+  async setTopUpBill(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Param('entryId', ParseUUIDPipe) entryId: string,
+    @Req() req: FastifyRequest,
+  ) {
+    const file = await readSingleUploadedFile(req, {
+      allowedMimeTypes: BILL_ALLOWED_MIME_TYPES,
+      maxBytes: MAX_UPLOAD_BYTES,
+    });
+    return this.orgService.setTopUpBill(actor.userId, orgId, userId, entryId, file);
+  }
+
+  // Presigned URL for a top-up's bill — the browser loads it directly from the bucket
+  // (no bytes through the API). Authenticated-only; service authorizes self/admin/manager.
+  // ?download=true forces a save dialog instead of inline rendering.
+  @Get(':orgId/members/:userId/credit/:entryId/bill')
+  @UseGuards(JwtAccessGuard)
+  getTopUpBillUrl(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Param('entryId', ParseUUIDPipe) entryId: string,
+    @Query('download') download?: string,
+  ) {
+    return this.orgService.getTopUpBillUrl(
+      actor.userId,
+      orgId,
+      userId,
+      entryId,
+      download === 'true',
+    );
+  }
+
+  // Remove a top-up's bill (deletes the stored object). Gated by manage_org_members.
+  @Delete(':orgId/members/:userId/credit/:entryId/bill')
+  deleteTopUpBill(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Param('entryId', ParseUUIDPipe) entryId: string,
+  ) {
+    return this.orgService.deleteTopUpBill(actor.userId, orgId, userId, entryId);
   }
 
   @Get(':orgId/members/:userId/groups')

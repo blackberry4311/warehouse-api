@@ -37,8 +37,10 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   manage_org_members: [
     'post /organizations/:orgId/members',
     'delete /organizations/:orgId/members/:userId',
-    // Managing members includes managing their credit top-ups.
+    // Managing members includes managing their credit top-ups and top-up bills.
     'post /organizations/:orgId/members/:userId/credit',
+    'put /organizations/:orgId/members/:userId/credit/:entryId/bill',
+    'delete /organizations/:orgId/members/:userId/credit/:entryId/bill',
   ],
   view_org_members: ['get /organizations/:orgId/members'],
   view_user_permissions: ['get /organizations/:orgId/members/:userId/permissions'],

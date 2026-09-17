@@ -1,13 +1,21 @@
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
+import multipart from '@fastify/multipart';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
+import { MAX_UPLOAD_BYTES } from './common/uploaded-file.util';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({ logger: true }),
   );
+
+  // Enables multipart/form-data file uploads (read via readSingleUploadedFile).
+  // One file per request, capped at MAX_UPLOAD_BYTES.
+  await app.register(multipart, {
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 },
+  });
 
   // Comma-separated allowlist, e.g. "https://app.example.com,http://localhost:3000".
   // Defaults to the local FE dev origin.

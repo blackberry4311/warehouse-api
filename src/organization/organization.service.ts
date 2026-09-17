@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   ConflictException,
   ForbiddenException,
   Injectable,
@@ -16,6 +17,7 @@ import { GroupPermission } from '../entities/group-permission.entity';
 import { User } from '../entities/user.entity';
 import { OrgFee } from '../entities/org-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
+import { CreditResource } from '../entities/credit-resource.entity';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
@@ -25,6 +27,9 @@ import { UpdateUserDto } from './dto/update-user.dto';
 import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
 import { decodeCursor, parseLimit, toPage } from '../common/pagination.util';
+import { attachBillFlag, BILL_URL_TTL_SECONDS } from '../common/credit-bill.util';
+import { StorageService } from '../storage/storage.service';
+import { UploadedFile } from '../common/uploaded-file.util';
 
 /**
  * Manages everything under an organization: membership, groups (roles),
@@ -43,6 +48,8 @@ export class OrganizationService {
     @InjectRepository(User) private userRepo: Repository<User>,
     @InjectRepository(OrgFee) private orgFeeRepo: Repository<OrgFee>,
     @InjectRepository(CreditHistory) private creditHistoryRepo: Repository<CreditHistory>,
+    @InjectRepository(CreditResource) private creditResourceRepo: Repository<CreditResource>,
+    private readonly storage: StorageService,
   ) {}
 
   // --- Organizations -------------------------------------------------------
@@ -529,6 +536,8 @@ export class OrganizationService {
     const limit = parseLimit(limitRaw);
     const qb = this.creditHistoryRepo
       .createQueryBuilder('c')
+      .leftJoin('c.resource', 'resource')
+      .addSelect('resource.id')
       .where('c.userId = :userId', { userId: targetUserId })
       .andWhere('c.orgId = :orgId', { orgId })
       .orderBy('c.createdAt', 'DESC')
@@ -543,8 +552,157 @@ export class OrganizationService {
       });
     }
 
-    const history = toPage(await qb.getMany(), limit);
+    const history = attachBillFlag(toPage(await qb.getMany(), limit));
     return { userId: target.id, orgId, credit: target.credit, history };
+  }
+
+  // --- Top-up bills (receipt images) --------------------------------------
+
+  /**
+   * Attach (or replace) the bill/receipt image on a `TOP_UP` ledger entry. One
+   * bill per entry: a re-upload deletes the previous object first. Only the image
+   * moves — the top-up's amount/note/balances stay immutable. Gated by
+   * `manage_org_members` (same as the top-up itself, via API_PERMISSION_MAP); the
+   * acting user must belong to the org and the entry must be this org's TOP_UP for
+   * the target member. Bills auto-expire after two weeks — see {@link expireOldBills}.
+   */
+  async setTopUpBill(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    entryId: string,
+    file: UploadedFile,
+  ) {
+    await this.getOrganization(orgId);
+    await this.assertOrgMembership(orgId, actingUserId);
+    const entry = await this.loadTopUpEntry(orgId, targetUserId, entryId);
+
+    const existing = await this.creditResourceRepo.findOne({ where: { creditId: entry.id } });
+    const previousKey = existing?.objectKey;
+    const key = this.storage.buildKey('credit-bills', file.filename, entry.id);
+    await this.storage.put(key, file.buffer, file.mimetype);
+
+    const resource = this.creditResourceRepo.create({
+      id: existing?.id,
+      creditId: entry.id,
+      objectKey: key,
+      contentType: file.mimetype,
+      size: file.size,
+    });
+    const saved = await this.creditResourceRepo.save(resource);
+
+    // Best-effort: only after the new key is safely committed do we drop the old
+    // object, so a failed delete can never leave the row pointing at nothing.
+    if (previousKey && previousKey !== key) await this.storage.delete(previousKey);
+
+    return {
+      entryId: entry.id,
+      contentType: saved.contentType,
+      size: saved.size,
+      uploadedAt: saved.createdAt,
+    };
+  }
+
+  /**
+   * Issue a **presigned URL** for a top-up's bill so the browser loads it directly
+   * from the bucket — no bytes through the API. Valid for `BILL_URL_TTL_SECONDS`; the
+   * FE re-requests when it expires. Readable by the member themselves, a system admin,
+   * or a `manage_org_members` holder in the org (same rule as {@link getMemberCredit});
+   * only issuing the URL is gated. 404 if the entry has no bill. Pass `download` to
+   * force a save dialog instead of inline render.
+   */
+  async getTopUpBillUrl(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    entryId: string,
+    download = false,
+  ): Promise<{ url: string; expiresIn: number; contentType: string | null }> {
+    const resource = await this.resolveViewableBill(actingUserId, orgId, targetUserId, entryId);
+    const filename = resource.objectKey.split('/').pop() ?? 'bill';
+    const url = await this.storage.getSignedUrl(
+      resource.objectKey,
+      BILL_URL_TTL_SECONDS,
+      download ? filename : undefined,
+    );
+    return { url, expiresIn: BILL_URL_TTL_SECONDS, contentType: resource.contentType };
+  }
+
+  /** Authorize the caller (self / admin / member-manager) and load the bill, or throw. */
+  private async resolveViewableBill(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    entryId: string,
+  ): Promise<CreditResource> {
+    await this.getOrganization(orgId);
+    const actor = await this.ensureUserExists(actingUserId);
+    if (actingUserId !== targetUserId && !actor.isAdmin) {
+      const canManage = await this.hasOrgPermission(orgId, actingUserId, 'manage_org_members');
+      if (!canManage) throw new ForbiddenException("You cannot view this member's bill");
+    }
+
+    const entry = await this.loadTopUpEntry(orgId, targetUserId, entryId);
+    const resource = await this.creditResourceRepo.findOne({ where: { creditId: entry.id } });
+    if (!resource) throw new NotFoundException('This top-up has no bill attached');
+    return resource;
+  }
+
+  /**
+   * Remove a top-up's bill (deletes the credit_resources row and the stored object).
+   * The ledger entry itself is untouched. Same gating as {@link setTopUpBill}.
+   */
+  async deleteTopUpBill(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    entryId: string,
+  ) {
+    await this.getOrganization(orgId);
+    await this.assertOrgMembership(orgId, actingUserId);
+    const entry = await this.loadTopUpEntry(orgId, targetUserId, entryId);
+
+    const resource = await this.creditResourceRepo.findOne({ where: { creditId: entry.id } });
+    if (!resource) throw new NotFoundException('This top-up has no bill attached');
+
+    await this.creditResourceRepo.delete({ id: resource.id });
+    await this.storage.delete(resource.objectKey);
+    return { entryId: entry.id, hasBill: false };
+  }
+
+  /**
+   * Delete bills older than `ttlDays` (default 14) to keep storage lean: removes the
+   * `credit_resources` row and its bucket object, leaving the immutable ledger entry
+   * intact. Idempotent and safe to run repeatedly — driven by a daily cron (see
+   * CreditBillCleanupService). Returns how many bills were expired.
+   */
+  async expireOldBills(ttlDays = 14): Promise<number> {
+    const cutoff = new Date(Date.now() - ttlDays * 24 * 60 * 60 * 1000);
+    const stale = await this.creditResourceRepo
+      .createQueryBuilder('r')
+      .where('r.createdAt < :cutoff', { cutoff })
+      .getMany();
+
+    for (const resource of stale) {
+      await this.creditResourceRepo.delete({ id: resource.id });
+      await this.storage.delete(resource.objectKey);
+    }
+    return stale.length;
+  }
+
+  /** Load a TOP_UP entry scoped to (org, target member), or 404. */
+  private async loadTopUpEntry(orgId: string, targetUserId: string, entryId: string) {
+    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: targetUserId } });
+    if (!membership) throw new NotFoundException('User is not a member of this organization');
+
+    const entry = await this.creditHistoryRepo.findOne({
+      where: { id: entryId, orgId, userId: targetUserId },
+    });
+    if (!entry) throw new NotFoundException('Credit entry not found');
+    if (entry.entryType !== CreditEntryType.TOP_UP) {
+      throw new BadRequestException('A bill can only be attached to a top-up entry');
+    }
+    return entry;
   }
 
   private async ensureUserExists(userId: string) {

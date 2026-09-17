@@ -4,6 +4,7 @@ import {
   Entity,
   JoinColumn,
   ManyToOne,
+  OneToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
 import { Organization } from './organization.entity';
@@ -11,6 +12,7 @@ import { Order } from './order.entity';
 import { Shipment } from './shipment.entity';
 import { TotalFee } from './total-fee.entity';
 import { User } from './user.entity';
+import { CreditResource } from './credit-resource.entity';
 import { numericTransformer } from './numeric.transformer';
 
 /**
@@ -103,6 +105,14 @@ export class CreditHistory {
   @ManyToOne(() => TotalFee, { onDelete: 'SET NULL', onUpdate: 'CASCADE' })
   @JoinColumn({ name: 'fee_id_fk' })
   fee: TotalFee | null;
+
+  /**
+   * An attached file resource (a `TOP_UP`'s bill/receipt), or null. Lives in the
+   * separate `credit_resources` table; joined to expose a `hasBill` flag on the
+   * ledger without bloating this row. See {@link CreditResource}.
+   */
+  @OneToOne(() => CreditResource, (r) => r.credit)
+  resource: CreditResource | null;
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;

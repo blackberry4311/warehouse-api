@@ -17,6 +17,7 @@ import { OrderHistory } from './entities/order-history.entity';
 import { OrderSequence } from './entities/order-sequence.entity';
 import { OrgFee } from './entities/org-fee.entity';
 import { CreditHistory } from './entities/credit-history.entity';
+import { CreditResource } from './entities/credit-resource.entity';
 import { Shipment } from './entities/shipment.entity';
 import { ShipmentDetail } from './entities/shipment-detail.entity';
 import { ShipmentHistory } from './entities/shipment-history.entity';
@@ -29,10 +30,14 @@ import { OrderModule } from './order/order.module';
 import { ShipmentModule } from './shipment/shipment.module';
 import { ExtraFeeModule } from './extra-fee/extra-fee.module';
 import { UserModule } from './user/user.module';
+import { StorageModule } from './storage/storage.module';
+import { ScheduleModule } from '@nestjs/schedule';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    ScheduleModule.forRoot(),
+    StorageModule,
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
@@ -54,6 +59,7 @@ import { UserModule } from './user/user.module';
           OrderSequence,
           OrgFee,
           CreditHistory,
+          CreditResource,
           Shipment,
           ShipmentDetail,
           ShipmentHistory,

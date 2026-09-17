@@ -72,6 +72,15 @@ Required env vars (see `.env.sample`):
 - `DATABASE_URL` — Postgres connection string. Note: the sample value still points at a DB named
   `innerworld` (a leftover); change it to your local warehouse DB.
 - `JWT_ACCESS_SECRET` / `JWT_ACCESS_EXPIRY`, `JWT_REFRESH_SECRET` / `JWT_REFRESH_EXPIRY`
+- **Object storage** (`StorageService`, for uploaded files such as top-up bills): `S3_ENDPOINT` (the
+  storage host **only** — never append a folder), `S3_REGION` (default `auto`), `S3_BUCKET`,
+  `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE` (default `true`; required by Railway
+  Buckets / MinIO / Garage), optional `S3_PREFIX` — a key prefix ("folder", e.g. `dev` / `prod`)
+  prepended to every object to segregate environments that share one bucket (Railway already gives each
+  environment its own bucket, so this is often unnecessary), and optional `S3_PUBLIC_ENDPOINT` — a
+  browser-reachable host used **only** to sign presigned URLs (set it when `S3_ENDPOINT` is a
+  private/internal endpoint; the signature is host-specific). Boot doesn't fail if these are unset; only
+  calls that touch the bucket do.
 - `ANTHROPIC_API_KEY` — present in `.env.sample` but not read anywhere in `src/` yet.
 
 The server listens on `PORT` (default **3003**), bound to `0.0.0.0`. `main.ts` enables CORS for
@@ -82,7 +91,8 @@ class-validator decorators and unknown properties are rejected.
 ## Architecture
 
 ### Module layout
-- `AppModule` wires global `ConfigModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
+- `AppModule` wires global `ConfigModule`, `ScheduleModule.forRoot()` (for cron jobs, e.g. bill
+  expiry), the global `StorageModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
   `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, `ExtraFeeModule`, and
@@ -96,9 +106,11 @@ class-validator decorators and unknown properties are rejected.
 - `OrganizationModule` (`src/organization/`) — manages everything under an organization: the org
   itself, membership (users_orgs), groups/roles (org_groups), the global permission catalog
   (permissions), the group↔permission and user↔group wiring, and the **credit / billing layer**
-  (per-org fees, member credit top-ups, and the credit-review endpoint). It exports
-  `OrganizationService` for reuse (by `RbacModule` for permission resolution, and by the order /
-  shipment / self-service modules); it does **not** own the global guard.
+  (per-org fees, member credit top-ups, the credit-review endpoint, and **top-up bills** — see
+  **Credit / billing**). It exports `OrganizationService` for reuse (by `RbacModule` for permission
+  resolution, and by the order / shipment / self-service modules); it does **not** own the global guard.
+  It also registers `CreditBillCleanupService` — a daily `@Cron` that expires bills older than two weeks
+  via `OrganizationService.expireOldBills` — and injects the global `StorageService` for bill uploads.
 - `RbacModule` (`src/rbac/`) — the authorization layer: registers the map-driven global
   `PermissionsGuard` (via `APP_GUARD`, so it runs on every route) and owns the authored
   `PERMISSION_API_MAP` source of truth (`src/rbac/permissions.config.ts`). Imports `OrganizationModule`
@@ -138,6 +150,21 @@ class-validator decorators and unknown properties are rejected.
   `manage_all_users`, so the global `PermissionsGuard` gates it (admins bypass) before the
   controller-level `JwtAccessGuard` runs. Reuses the shared keyset pagination helper for both the credit
   ledger and the directory.
+- `StorageModule` (`src/storage/`) — a `@Global` module exporting `StorageService`, a deliberately
+  **feature-agnostic** wrapper over S3-compatible object storage (`@aws-sdk/client-s3`). Configured from
+  `S3_*` env vars; runs on **Railway Buckets** in prod but works unchanged with Cloudflare R2 / MinIO /
+  Garage / AWS S3. Methods: `put(key, body, contentType)`,
+  `delete(key)`, `buildKey(prefix, filename, label?)` — a flat, unique key
+  `[<S3_PREFIX>/]<prefix>/[<label>-]<uuid><ext>` (the optional `label`, e.g. an owning row id, is
+  prepended for traceability; no extra path level; bill keys are `credit-bills/<entryId>-<uuid><ext>`),
+  and `getSignedUrl(key, expiresIn?, downloadFilename?)` — a short-lived **presigned GET URL** the
+  browser opens directly (no bytes through the API), signed against `S3_PUBLIC_ENDPOINT` when set.
+  It knows nothing about credit/bills — callers own the key scheme and any DB bookkeeping — so other
+  features (e.g. future shipment images) reuse it. First consumer: **top-up bills** (see **Credit /
+  billing** → **Top-up bills**). Boot never fails when storage is unconfigured; only calls that touch
+  the bucket do. File uploads arrive as `multipart/form-data` via `@fastify/multipart` (registered in
+  `main.ts`, 1 file, 10 MB cap) and are read with the reusable `readSingleUploadedFile` helper
+  (`src/common/uploaded-file.util.ts`, enforces content-type + size).
 
 ### Organization / RBAC endpoints (`OrganizationController`, prefix `organizations`)
 - Me: `GET /organizations/me` — the caller's access tree
@@ -152,7 +179,16 @@ class-validator decorators and unknown properties are rejected.
 - Member credit: `POST /organizations/:orgId/members/:userId/credit` (requires `manage_org_members`)
   tops a member up (writes a `TOP_UP` ledger row); `GET /organizations/:orgId/members/:userId/credit`
   returns `{ userId, orgId, credit, history }` — the member's wallet balance plus their org-scoped
-  ledger, cursor-paginated. See **Credit / billing** below.
+  ledger, cursor-paginated (each ledger row carries a `hasBill` boolean). See **Credit / billing** below.
+- Top-up bills: `PUT /organizations/:orgId/members/:userId/credit/:entryId/bill` (requires
+  `manage_org_members`) attaches **or replaces** the bill/receipt image on a `TOP_UP` entry
+  (`multipart/form-data`, one file field; jpeg/png/webp/pdf, ≤10 MB — only the image changes, the
+  top-up's amount/note/balances stay immutable). `DELETE .../credit/:entryId/bill` (requires
+  `manage_org_members`) removes it. `GET .../credit/:entryId/bill` (authenticated-only; the service
+  authorizes self / admin / `manage_org_members`, like the credit read) returns a **presigned URL**
+  `{ url, expiresIn, contentType }` so the FE loads the image straight from the bucket, never proxying
+  bytes through the API (`?download=true` forces a save dialog); the URL is valid for
+  `BILL_URL_TTL_SECONDS` (7 days). See **Credit / billing** → **Top-up bills**.
 - Fees (system-admin only): `POST|GET /organizations/:orgId/fees` — set / list an org's flat fees.
 - Groups: `POST|GET /organizations/:orgId/groups`, `DELETE /organizations/:orgId/groups/:groupId`.
 - Group membership: `POST /organizations/:orgId/groups/:groupId/members`,
@@ -484,6 +520,28 @@ endpoint); there is no separate module.
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
   (`ORDER_LOCK`, `SHIPMENT_LOCK`, `EXTRA_FEE`) in `credit_history` — top-ups (positive) are excluded, and
   because an extra-fee void is a positive `EXTRA_FEE` reversal it nets its original charge back out.
+- **Top-up bills.** A `TOP_UP` entry can carry one bill/receipt image, stored in a **separate**
+  `credit_resources` table (`CreditResource` entity) rather than on `credit_history` — deliberately kept
+  off the append-only ledger so it stays lean and the image data can be cleaned up independently. The row
+  holds the object-storage `object_key` (+ `content_type`, `size`, `created_at`) and a **unique**
+  `credit_id_fk` (→ `credit_history`, `on delete cascade`), enforcing one bill per entry; the image bytes
+  live in the bucket via `StorageService`, never in the DB. Managed via `OrganizationService`
+  (`setTopUpBill` / `getTopUpBillUrl` / `deleteTopUpBill`) over the `PUT|GET|DELETE
+  .../credit/:entryId/bill` routes (see the org endpoints above; the `GET` returns a presigned URL, not
+  the bytes); a re-upload writes a fresh object and deletes the old one, and only the image ever changes
+  (the ledger entry is immutable).
+  The FE views a bill **only** via `getTopUpBillUrl`, which returns a **presigned URL** the browser
+  fetches directly from the bucket — bill bytes never pass through the API (there is no server-side
+  streaming route). Two independent knobs in `src/common/credit-bill.util.ts`: `BILL_TTL_DAYS` (14,
+  retention → the cleanup cron) and `BILL_URL_TTL_SECONDS` (7 days, presigned-URL lifetime — kept at the
+  standard SigV4 max so URLs stay valid on R2 / MinIO / AWS too, not just Railway Buckets which allow up
+  to 90 days). The two
+  credit-ledger read paths (`getMemberCredit`, `UserService.getMyCredit`) `leftJoin` this table and
+  expose a `hasBill` boolean per row via `attachBillFlag` (`src/common/credit-bill.util.ts`) — the raw
+  `object_key` is never returned to clients. **Bills auto-expire after 14 days**: `expireOldBills` (a
+  daily `@Cron` in `CreditBillCleanupService`) deletes `credit_resources` rows older than the TTL and
+  their bucket objects. (A cron is used because Railway Buckets' native S3 lifecycle-rule support isn't
+  documented; if confirmed, it can be replaced by a bucket lifecycle rule.)
 
 ### User endpoints (`UserController`, prefix `users`)
 Mostly self-service for the **authenticated caller**, scoped to `/me` — every `/me` action targets the
@@ -575,8 +633,8 @@ them into `init.sql` when it is next brought up to date, per **Environment / run
 Postgres schema is `wh` (not `public`); table/column names are snake_case. `scripts/init.sql` is the
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
-`OrderDetail`, `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `Shipment`,
-`ShipmentDetail`, `ShipmentHistory`, `ShipmentSequence`, `TotalFee`.
+`OrderDetail`, `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `CreditResource`,
+`Shipment`, `ShipmentDetail`, `ShipmentHistory`, `ShipmentSequence`, `TotalFee`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -650,7 +708,16 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   `shipment_id_fk` (→ `shipments`), and nullable `fee_id_fk` (→ `total_fees`), all `on delete set
   null`, linking a movement to what triggered it. Indexed by `(user_id_fk, created_at desc, id desc)` and
   `(org_id_fk, created_at desc, id desc)` for the two ledger read paths, plus `order_id_fk`,
-  `shipment_id_fk`, and `fee_id_fk`.
+  `shipment_id_fk`, and `fee_id_fk`. A `resource` `@OneToOne(CreditResource)` relation (inverse side,
+  no column) is layered on for the `hasBill` flag — see below.
+- `CreditResource` → `credit_resources` — a file attached to a credit entry (today a `TOP_UP`'s
+  bill/receipt image), kept off `credit_history` so the ledger stays lean and the data can be cleaned up
+  independently. `object_key` (the S3 key), `content_type`, `size` (`bigint`, `numericTransformer`),
+  `created_at` (`timestamp(3)`), and a **unique** `credit_id_fk` (→ `credit_history`, `on delete
+  cascade`) enforcing one resource per entry. Bytes live in object storage (`StorageService`), never
+  here. Indexes: unique `credit_resources_credit_unique (credit_id_fk)` and
+  `credit_resources_created_idx (created_at)` (backs the daily expiry scan). See **Credit / billing** →
+  **Top-up bills**.
 - `TotalFee` → `total_fees` — every fee on one order **or** one shipment: `name`, `amount`
   (`numeric`, `CHECK amount >= 0`), `is_protected` (`boolean`, default false — true = the non-voidable
   lock fee, false = a voidable extra fee), `org_id_fk`, mutually-exclusive nullable `order_id_fk` /
@@ -662,8 +729,8 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 Note: Postgres `numeric` columns come back as strings from TypeORM — the `Order`/`OrderHistory` qty
 columns (including the deprecated `orders.shipped_qty`), `order_details.qty`, the
 `shipment_details`/`ShipmentHistory` qty columns, `users.credit`, `org_fees.amount`,
-`total_fees.amount`, and the `credit_history` amount/balance columns all use `numericTransformer`
-(`src/entities/numeric.transformer.ts`) to expose them as `number`.
+`total_fees.amount`, the `credit_history` amount/balance columns, and `credit_resources.size` all use
+`numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
 
 Composite-key join entities map the raw uuid columns with `@PrimaryColumn` and layer the `@ManyToOne`
 relation on the same column via `@JoinColumn` — follow that pattern for new junctions.
