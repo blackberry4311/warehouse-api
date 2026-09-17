@@ -6,21 +6,68 @@ import {
   ManyToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
-import { Order, OrderStatus } from './order.entity';
+import { Order } from './order.entity';
 import { User } from './user.entity';
-import { numericTransformer } from './numeric.transformer';
 
+/**
+ * The kind of change an `order_history` row records. Order-level and line-level
+ * changes are distinguished so the FE can render a headline without parsing the
+ * `changes` payload.
+ */
 export enum OrderChangeType {
+  /** Order placed — `changes` snapshots the header and every line. */
   CREATED = 'CREATED',
-  STATUS_CHANGE = 'STATUS_CHANGE',
-  QTY_CHANGE = 'QTY_CHANGE',
-  /** A reviewer (`review_order`) locked the order, handing it to operations. */
+  /** Header field(s) edited (e.g. `tracking`). */
+  ORDER_UPDATED = 'ORDER_UPDATED',
+  /** Header status moved. */
+  STATUS_CHANGED = 'STATUS_CHANGED',
+  /** A reviewer locked the order, handing it to operations. */
   LOCKED = 'LOCKED',
+  /** A line was added. */
+  ITEM_ADDED = 'ITEM_ADDED',
+  /** A line's name/qty/note was edited. */
+  ITEM_UPDATED = 'ITEM_UPDATED',
+  /** A line was removed. */
+  ITEM_REMOVED = 'ITEM_REMOVED',
+  /** Operations set a line's receipt status (PENDING → RECEIVED / …). */
+  ITEM_RECEIPT = 'ITEM_RECEIPT',
 }
 
 /**
- * Append-only audit trail for an order. One row per change; a CREATED row is
- * written when the order is first placed. The prev/new columns hold only what changed.
+ * A single field's before/after. `from` is omitted when a value is first set (an
+ * add / CREATED), `to` is omitted when it is cleared (a remove). Values are whatever
+ * the field holds — string, number, or null.
+ */
+export interface FieldDiff {
+  from?: string | number | boolean | null;
+  to?: string | number | boolean | null;
+}
+
+/** The change to one line item, with a display-name snapshot and per-field diffs. */
+export interface OrderItemChange {
+  /** The line's id (its `order_details.id`). */
+  detailId: string;
+  /** The line's name at the time — a snapshot, so a removed line still renders. */
+  name: string;
+  /** Per-field before/after (e.g. `qty`, `name`, `note`, `status`). */
+  fields?: Record<string, FieldDiff>;
+}
+
+/**
+ * The structured `changes` payload. `order` holds header-field diffs; `item` holds a
+ * single line's change (the granular /details endpoints touch one line at a time);
+ * `items` is used only by CREATED to snapshot every line at placement.
+ */
+export interface OrderChange {
+  order?: Record<string, FieldDiff>;
+  item?: OrderItemChange;
+  items?: OrderItemChange[];
+}
+
+/**
+ * Append-only audit trail for an order. One row per user action; the `change_type`
+ * categorizes it and the `changes` JSON carries the before/after detail the FE shows
+ * the client.
  */
 @Entity({ schema: 'wh', name: 'order_history' })
 export class OrderHistory {
@@ -42,17 +89,9 @@ export class OrderHistory {
   @Column({ type: 'varchar', length: 50, name: 'change_type' })
   changeType: OrderChangeType;
 
-  @Column({ type: 'varchar', length: 50, name: 'prev_status', nullable: true })
-  prevStatus: OrderStatus | null;
-
-  @Column({ type: 'varchar', length: 50, name: 'new_status', nullable: true })
-  newStatus: OrderStatus | null;
-
-  @Column({ type: 'numeric', name: 'prev_qty', nullable: true, transformer: numericTransformer })
-  prevQty: number | null;
-
-  @Column({ type: 'numeric', name: 'new_qty', nullable: true, transformer: numericTransformer })
-  newQty: number | null;
+  /** Structured before/after for this change; see {@link OrderChange}. */
+  @Column({ type: 'jsonb', nullable: true })
+  changes: OrderChange | null;
 
   @Column({ type: 'text', nullable: true })
   note: string | null;

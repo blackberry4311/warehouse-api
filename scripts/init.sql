@@ -1,15 +1,15 @@
 create table users
 (
-    id            uuid                     default gen_random_uuid() not null
+    id            uuid                        default gen_random_uuid() not null
         primary key,
-    email         varchar                                            not null,
-    password_hash varchar                                            not null,
-    display_name  varchar                                            not null,
-    is_admin      boolean                  default false             not null,
-    created_at    timestamp with time zone default now()             not null,
+    email         varchar                                               not null,
+    password_hash varchar                                               not null,
+    display_name  varchar                                               not null,
+    is_admin      boolean                     default false             not null,
+    created_at    timestamp(3) with time zone default now()             not null,
     updated_at    timestamp with time zone,
     code          varchar(16),
-    credit        numeric                  default 0                 not null
+    credit        numeric                     default 0                 not null
 );
 
 create unique index user_unique
@@ -232,33 +232,6 @@ create table shipments
     updated_at      timestamp with time zone
 );
 
-create table credit_history
-(
-    id             uuid                        default gen_random_uuid() not null
-        primary key,
-    user_id_fk     uuid                                                  not null
-        references users
-            on update cascade on delete cascade,
-    org_id_fk      uuid                                                  not null
-        references organizations
-            on update cascade on delete cascade,
-    entry_type     varchar(50)                                           not null
-        constraint credit_history_entry_type_check
-            check ((entry_type)::text = ANY
-                   (ARRAY [('ORDER_LOCK'::character varying)::text, ('SHIPMENT_LOCK'::character varying)::text, ('TOP_UP'::character varying)::text, ('ADJUSTMENT'::character varying)::text])),
-    amount         numeric                                               not null,
-    prev_balance   numeric                                               not null,
-    new_balance    numeric                                               not null,
-    order_id_fk    uuid
-                                                                         references orders
-                                                                             on update cascade on delete set null,
-    note           text,
-    created_at     timestamp(3) with time zone default now()             not null,
-    shipment_id_fk uuid
-                                                                         references shipments
-                                                                             on update cascade on delete set null
-);
-
 create index shipments_org_created_idx
     on shipments (org_id_fk asc, created_at desc, id desc);
 
@@ -319,6 +292,83 @@ create table shipment_sequences
     next_seq   bigint default 0 not null,
     primary key (user_id_fk, org_id_fk)
 );
+
+create table total_fees
+(
+    id             uuid                        default gen_random_uuid() not null
+        constraint extra_fees_pkey
+            primary key,
+    name           varchar(200)                                          not null,
+    amount         numeric                                               not null
+        constraint total_fees_amount_check
+            check (amount >= (0)::numeric),
+    org_id_fk      uuid                                                  not null
+        constraint extra_fees_org_id_fk_fkey
+            references organizations
+            on update cascade on delete cascade,
+    order_id_fk    uuid
+        constraint extra_fees_order_id_fk_fkey
+            references orders
+            on update cascade on delete cascade,
+    shipment_id_fk uuid
+        constraint extra_fees_shipment_id_fk_fkey
+            references shipments
+            on update cascade on delete cascade,
+    created_by_fk  uuid                                                  not null
+        constraint extra_fees_created_by_fk_fkey
+            references users
+            on update cascade,
+    note           text,
+    voided_at      timestamp(3) with time zone,
+    voided_by_fk   uuid
+        constraint extra_fees_voided_by_fk_fkey
+            references users
+            on update cascade,
+    created_at     timestamp(3) with time zone default now()             not null,
+    is_protected   boolean                     default false             not null,
+    constraint extra_fees_one_target
+        check ((order_id_fk IS NOT NULL) <> (shipment_id_fk IS NOT NULL))
+);
+
+create table credit_history
+(
+    id             uuid                        default gen_random_uuid() not null
+        primary key,
+    user_id_fk     uuid                                                  not null
+        references users
+            on update cascade on delete cascade,
+    org_id_fk      uuid                                                  not null
+        references organizations
+            on update cascade on delete cascade,
+    entry_type     varchar(50)                                           not null
+        constraint credit_history_entry_type_check
+            check ((entry_type)::text = ANY
+                   (ARRAY [('ORDER_LOCK'::character varying)::text, ('SHIPMENT_LOCK'::character varying)::text, ('EXTRA_FEE'::character varying)::text, ('TOP_UP'::character varying)::text, ('ADJUSTMENT'::character varying)::text])),
+    amount         numeric                                               not null,
+    prev_balance   numeric                                               not null,
+    new_balance    numeric                                               not null,
+    order_id_fk    uuid
+                                                                         references orders
+                                                                             on update cascade on delete set null,
+    note           text,
+    created_at     timestamp(3) with time zone default now()             not null,
+    shipment_id_fk uuid
+                                                                         references shipments
+                                                                             on update cascade on delete set null,
+    fee_id_fk      uuid
+        constraint credit_history_extra_fee_id_fk_fkey
+            references total_fees
+            on update cascade on delete set null
+);
+
+create index credit_history_fee_id_idx
+    on credit_history (fee_id_fk);
+
+create index total_fees_order_created_idx
+    on total_fees (order_id_fk asc, created_at desc, id desc);
+
+create index total_fees_shipment_created_idx
+    on total_fees (shipment_id_fk asc, created_at desc, id desc);
 
 INSERT INTO users (id, email, password_hash, display_name, is_admin, created_at, updated_at, code, credit)
 VALUES ('0ccead85-d5c4-487b-9777-8aac535de9d8', 'sytoanit@gmail.com',

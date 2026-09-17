@@ -1,8 +1,16 @@
-import { IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 import { OrderStatus } from '../../entities/order.entity';
 
+/** The order-header states a caller may move an order to (COMPLETED is excluded — it
+ * is shipment-only legacy, never a client/operations move). */
+const MANAGED_STATUSES = [
+  OrderStatus.IN_TRANSIT,
+  OrderStatus.IN_WAREHOUSE,
+  OrderStatus.CANCELLED,
+] as const;
+
 export class UpdateOrderStatusDto {
-  @IsEnum(OrderStatus)
+  @IsIn(MANAGED_STATUSES)
   status: OrderStatus;
 
   /** Optional note recorded on the STATUS_CHANGE history entry. */

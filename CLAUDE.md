@@ -6,10 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `warehouse-api`: a NestJS 11 (Fastify) backend. It implements JWT-based authentication
 (register / login / refresh / logout), a **multi-tenant RBAC layer** (organizations, membership,
-groups/roles, and permissions), an **order system** (org-scoped orders with a status lifecycle
+groups/roles, and permissions), an **order system** (org-scoped orders built from one or more
+**line items** — each with its own quantity and receipt status — with a header status lifecycle
 and an audit trail), a **shipment system** (org-scoped outbound shipments that draw quantity from
 one or more warehoused orders, mirroring the order flow — status lifecycle, review-lock gate, and
-audit trail), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
+audit trail; **being migrated** to draw from order line items in phase 2, see below), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
 order or a shipment is locked — plus ad-hoc, named **extra fees** staff add against an individual
 order or shipment — with a full ledger), and a small **self-service layer** (the authenticated user
 reads/updates their own profile and reviews their own wallet), all over a Postgres database in the
@@ -104,8 +105,9 @@ class-validator decorators and unknown properties are rejected.
   for `OrganizationService` (permission resolution), plus `JwtModule` and the `User` repo the guard
   needs. Nothing imports `RbacModule` back, so the graph stays acyclic (Rbac → Organization → Auth);
   `AuthModule` stays a lean authN-only module and does **not** know a guard exists.
-- `OrderModule` (`src/order/`) — the order system: place orders, drive their status lifecycle, and
-  read orders + history. Standalone module (not part of `OrganizationModule`); it imports
+- `OrderModule` (`src/order/`) — the order system: place orders (a header plus one or more **line
+  items** / `order_details`), manage their lines, drive the header status lifecycle, confirm per-line
+  receipt, and read orders + history. Standalone module (not part of `OrganizationModule`); it imports
   `OrganizationModule` only to reuse `OrganizationService` (org existence, `assertOrgMembership`,
   `resolveUserCode`, `hasOrgPermission`). All order logic lives in `OrderService` — including the
   credit charge on lock, which reads `org_fees` and writes `credit_history` directly in its
@@ -175,15 +177,16 @@ used to act on another — mirroring `POST /organizations/users`.
 three permissions, split around a **lock** — a reviewer's one-way gate that hands an order off from
 the client to operations (`orders.locked`; when and by whom it was locked are recorded on the `LOCKED`
 `order_history` row's `created_at` / `changed_by_fk`, not on the order; orthogonal to `status`):
-- `place_order` — a **client**: places orders, and while the order is still **unlocked** edits its qty
-  and drives its two client-reported pending states (`SHIPPING ↔ ARRIVING`) or cancels it; reads
+- `place_order` — a **client**: places orders, and while the order is still **unlocked** edits its
+  header (`tracking`) and its **line items** (add / edit / remove lines) or cancels it; reads
   **only the orders they placed** (and those orders' history).
-- `review_order` — a **reviewer**: reviews and **locks** a pending (`SHIPPING`/`ARRIVING`) order via
-  `POST /orders/:orderId/lock`, edits a **locked** order's qty (but **not** its status), and reads
-  **every order in the org**. Locking freezes the client out and surfaces the order into the operations
-  queue. Only `review_order` can lock.
-- `process_order` — **operations staff**: drives a **locked** order's status along the warehouse
-  lifecycle, and reads **every *locked* order in the org** and its history.
+- `review_order` — a **reviewer**: reviews and **locks** an `IN_TRANSIT` order via
+  `POST /orders/:orderId/lock`, edits a **locked** order's header/lines (but **not** its status or
+  per-line receipt), and reads **every order in the org**. Locking freezes the client out and surfaces
+  the order into the operations queue. Only `review_order` can lock.
+- `process_order` — **operations staff**: drives a **locked** order's header status into the warehouse,
+  confirms each line's **receipt status** (`PATCH /orders/:orderId/details/:detailId/status`), and
+  reads **every *locked* order in the org** and its history.
 
 The three read routes (`GET /orders`, `GET /orders/:orderId`, `GET /orders/:orderId/history`) are
 reachable by **any** of these permissions — `PermissionsGuard` allows a route if the caller holds
@@ -195,27 +198,40 @@ client sees only `order.userId = :userId`. A caller holding several permissions 
 outside their scope, so they can't probe which orders exist. `listOrders` also accepts an optional
 `?locked=true|false` filter (useful for a reviewer splitting their review queue from the processed set).
 
-- `POST /orders` (`place_order`) — client places an order. Body `PlaceOrderDto` (`orgId`, `qty`,
-  **required** `tracking` — a free-text carrier reference/URL, since goods always ship via an external
-  system, optional `note`). Created as `SHIPPING`, unlocked.
+- `POST /orders` (`place_order`) — client places an order. Body `PlaceOrderDto` (`orgId`, **required
+  non-empty** `details` — an array of `{ name, qty, note? }` line items, where `name` is free text the
+  server prefixes with the client's code, **required** `tracking` — a free-text carrier reference/URL,
+  since goods always ship via an external system, optional `note`). Created as `IN_TRANSIT`, unlocked,
+  with each line `PENDING`. The order number is **always** auto-generated (there is no manual path).
 - `GET /orders?orgId=:orgId` (`place_order` | `review_order` | `process_order`) — list an org's orders
   (`orgId` required query param), newest first; scoped per the roles above. Optional `?status=`,
   `?search=`, `?locked=` filters. Cursor-paginated (see below).
 - `GET /orders/:orderId` (`place_order` | `review_order` | `process_order`) — one order; org derived
-  from the order. Scoped per the roles above. The response also carries `totalFee` — the sum of every
-  non-voided fee on the order (the protected lock fee plus active extra fees), so the FE can show the
-  running cost (`OrderService.getOrderDetail`).
-- `PATCH /orders/:orderId` — edit `qty`. Body `UpdateOrderDto` (`qty`, optional `note`); writes a
-  `QTY_CHANGE` row. Shared route, actor resolved by the lock gate: while **unlocked** only the owner
-  (`place_order`) may edit, and only while `SHIPPING`/`ARRIVING`; while **locked** only a reviewer
-  (`review_order`) may edit, up until a terminal state.
-- `PATCH /orders/:orderId/status` — move the order's status. Body `UpdateOrderStatusDto` (`status`,
-  optional `note`); writes a `STATUS_CHANGE` row. Shared route, actor resolved by the lock gate: while
-  **unlocked** only the owner (`place_order`) may move it (`SHIPPING ↔ ARRIVING`, or cancel); while
-  **locked** only operations (`process_order`) may move it (warehouse lifecycle).
-- `POST /orders/:orderId/lock` (`review_order`) — reviewer reviews and locks a `SHIPPING`/`ARRIVING`
-  order. Body `LockOrderDto` (optional `note`). Writes a `LOCKED` history row. 400 if already locked or
-  past the pending states. **Locking is the billing event**: the order's *client* (`order.userId`, not
+  from the order. Scoped per the roles above. The response carries the order's `details` (line items,
+  oldest first), `totalQty` (their summed quantity), and `totalFee` — the sum of every non-voided fee
+  on the order (the protected lock fee plus active extra fees), so the FE can show the running cost
+  (`OrderService.getOrderDetail`).
+- `PATCH /orders/:orderId` — edit the order **header** (`tracking`). Body `UpdateOrderDto` (`tracking`).
+  Shared route, actor resolved by the lock gate: while **unlocked** only the owner (`place_order`), and
+  only while `IN_TRANSIT`; while **locked** only a reviewer (`review_order`), up until a terminal state.
+- `POST /orders/:orderId/details` — add a line. Body `AddOrderDetailDto` (`name`, `qty`, optional
+  `note`). `PATCH /orders/:orderId/details/:detailId` — edit a line's `name`/`qty`/`note`
+  (`UpdateOrderDetailDto`, all optional, ≥1 required). `DELETE /orders/:orderId/details/:detailId` —
+  remove a line (an order must keep ≥1 line). All three are the **same lock-gated edit** as
+  `PATCH /orders/:orderId` (owner pre-lock, reviewer post-lock) and write an `ITEM_ADDED` /
+  `ITEM_UPDATED` / `ITEM_REMOVED` history row with the line's field diffs (see **Change tracking**).
+- `PATCH /orders/:orderId/details/:detailId/status` (`process_order`) — operations confirms a line's
+  **receipt**. Body `UpdateOrderDetailStatusDto` (`status` ∈ `RECEIVED`/`NOT_ARRIVED`/`CANCELLED`,
+  optional `note`). Only after the order is **locked** and while non-terminal; writes an `ITEM_RECEIPT`
+  row with the line's status diff. A `RECEIVED` line is a warehouse inventory unit.
+- `PATCH /orders/:orderId/status` — move the order **header** status. Body `UpdateOrderStatusDto`
+  (`status` ∈ `IN_TRANSIT`/`IN_WAREHOUSE`/`CANCELLED`, optional `note`); writes a `STATUS_CHANGED` row.
+  Shared route, actor resolved by the lock gate: while **unlocked** only the owner (`place_order`) may
+  move it (cancel); while **locked** only operations (`process_order`) may move it (into the warehouse,
+  or cancel).
+- `POST /orders/:orderId/lock` (`review_order`) — reviewer reviews and locks an `IN_TRANSIT` order.
+  Body `LockOrderDto` (optional `note`). Writes a `LOCKED` history row. 400 if already locked or not
+  `IN_TRANSIT`. **Locking is the billing event**: the order's *client* (`order.userId`, not
   the acting reviewer) is charged the org's `ORDER_LOCK` fee, and a 400 is returned if their credit
   can't cover it. See **Credit / billing** below.
 - `GET /orders/:orderId/history` (`place_order` | `review_order` | `process_order`) — the order's audit trail, oldest
@@ -233,35 +249,73 @@ history), backed by the composite indexes `orders_org_created_idx` / `order_hist
 Both `created_at` columns are `timestamp(3)` so the JS `Date` in the cursor round-trips exactly — full
 microsecond precision would make the cursor skip rows.
 
-**Status lifecycle** (`OrderStatus` enum + a DB `CHECK`): `SHIPPING → ARRIVING → IN_WAREHOUSE →
-COMPLETED`, with `CANCELLED` reachable from any live (non-terminal) state;
-`COMPLETED`/`CANCELLED` are terminal. Once an order reaches `IN_WAREHOUSE` the client can request a
-shipment against it (see the **Shipment system** below); an order is also driven to `COMPLETED`
-automatically — not by `updateStatus` — when shipments have shipped out all of its `qty`. The allowed
-moves are **split by the lock gate** into two tables in `OrderService`:
-- `CLIENT_TRANSITIONS` — what the owning client may do while **unlocked**: `SHIPPING ↔ ARRIVING`
-  (report their shipment) and cancel. These are the two client-reported pending states.
-- `PROCESS_TRANSITIONS` — what operations may do once **locked**: push from either pending state into
-  `IN_WAREHOUSE`, then on to `COMPLETED`, and cancel.
+**Line items (`order_details`).** Quantity lives on the **lines**, not the order header — each line
+has a `name` (the client's free text **slugified** and joined to their client `code` with a hyphen by
+`OrderService.composeName` — lowercased, non-letter/digit runs → single hyphen, e.g. code `ACME` +
+`"this is test"` → `ACME-this-is-test`), a `qty`, an optional `note`, and its own **receipt `status`**.
+An order always has ≥1 line. `OrderService` re-derives the header total from the lines (`totalQty`)
+rather than storing it.
+
+**Header status lifecycle** (`OrderStatus` enum + a DB `CHECK`): just three managed states,
+`IN_TRANSIT → IN_WAREHOUSE`, with `CANCELLED` reachable from either live state; `CANCELLED` is
+terminal. `IN_TRANSIT` is the single initial state (it replaced the old `SHIPPING`/`ARRIVING` pair).
+When operations moves an order to `IN_WAREHOUSE`, its lines are inventory items. The allowed moves are
+**split by the lock gate** into two tables in `OrderService`:
+- `CLIENT_TRANSITIONS` — what the owning client may do while **unlocked**: cancel an `IN_TRANSIT` order
+  (line edits go through the `/details` routes, not a status move).
+- `PROCESS_TRANSITIONS` — what operations may do once **locked**: `IN_TRANSIT → IN_WAREHOUSE`, or cancel.
 
 `updateStatus` picks the table by `order.locked` and checks the actor (owner pre-lock, `process_order`
 post-lock), so the client can never touch a locked order and operations can never touch an unlocked
-one. Locking is thus the handoff: a reviewer locks a `SHIPPING`/`ARRIVING` order, after which the
-warehouse lifecycle begins.
+one. Locking is thus the handoff: a reviewer locks an `IN_TRANSIT` order, after which the warehouse
+lifecycle begins.
+
+> **`OrderStatus.COMPLETED` is deprecated (phase-2 removal).** It is no longer part of the order
+> lifecycle — `updateStatus` never moves to it — and is retained in the enum and the DB `CHECK` only
+> because the not-yet-refactored shipment module still sets it. See the phase-2 note under **Shipment
+> system**.
+
+**Line receipt lifecycle** (`OrderDetailStatus` enum + a DB `CHECK` on `order_details.status`):
+`PENDING → RECEIVED` / `NOT_ARRIVED` / `CANCELLED`. A line is created `PENDING`; once the order is
+locked, operations resolves each line via `PATCH /orders/:orderId/details/:detailId/status`
+(`DETAIL_TRANSITIONS` in `OrderService` allows `RECEIVED ↔ NOT_ARRIVED` corrections; `CANCELLED` is
+terminal for a line). A `RECEIVED` line is a warehouse inventory unit; `NOT_ARRIVED` records a line the
+client declared but that never reached the warehouse.
 
 **Order numbers** are human-readable and generated per placement as `<user code>-<6-digit seq>`
 (e.g. `ACME-000123`):
 - `users.code` is a per-user client code, assigned at user creation (optional `code` in
   `CreateUserDto`, else derived from display name/email via `OrganizationService.resolveUserCode`).
-  Self-registered users without one get a code lazily on their first order.
+  Self-registered users without one get a code lazily on their first order. The same `code` also
+  prefixes each line item's `name`.
 - `wh.order_sequences` is a per-`(user, org)` counter bumped atomically inside the place-order
   transaction (`INSERT ... ON CONFLICT (user_id_fk, org_id_fk) DO UPDATE SET next_seq = next_seq + 1
-  RETURNING next_seq`). Because the sequence restarts per org, `order_number` is unique **per org**
-  (`unique (org_id_fk, order_number)`), not globally.
-- `placeOrder`, `updateOrder`, `lockOrder` and `updateStatus` each run in a single transaction that
-  writes the order **and** an `order_history` row (`CREATED` on placement, `QTY_CHANGE` on a client
-  edit, `LOCKED` on review, `STATUS_CHANGE` on status moves), so an order always has a matching audit
-  entry.
+  RETURNING next_seq`). Because the sequence restarts per org, `order_number` is unique **per org**,
+  not globally — enforced by the `orders_org_number_unique` unique index on
+  `(org_id_fk, order_number)` (and guaranteed by construction, since `users.code` is globally unique
+  and the sequence is atomic per `(user, org)`).
+- `placeOrder` (order + its lines), `updateOrder`, the `/details` mutations, `lockOrder` and
+  `updateStatus` each run in a single transaction that also writes an `order_history` row, so an order
+  always has a matching audit entry. See **Change tracking** for the row shape.
+
+**Change tracking.** `order_history` is a structured, append-only change log — one row per user action.
+Each row has a `change_type` (the headline the FE renders without parsing) plus a `changes` **`jsonb`**
+payload carrying the before/after detail (`OrderChange` in `order-history.entity.ts`), built by
+`OrderService` helpers (`writeHistory` / `itemChange`). The `changes` shape is a normalized `{ from,
+to }` diff:
+- `changes.order` — header-field diffs (e.g. `{ tracking: { from, to } }`, `{ status: { from, to } }`,
+  `{ locked: { from, to } }`).
+- `changes.item` — a single line's change: `{ detailId, name (snapshot), fields: { qty|name|note|status:
+  { from, to } } }` (the granular `/details` endpoints touch one line at a time; `ITEM_UPDATED` includes
+  only the fields that actually changed, `ITEM_ADDED` carries `to`-only, `ITEM_REMOVED` `from`-only).
+- `changes.items` — used **only** by `CREATED`, an array snapshotting every line at placement.
+
+Change types: `CREATED` (order + all lines snapshot), `ORDER_UPDATED` (header edit), `STATUS_CHANGED`
+(header status), `LOCKED`, `ITEM_ADDED` / `ITEM_UPDATED` / `ITEM_REMOVED` (line add/edit/remove),
+`ITEM_RECEIPT` (line receipt status). The old typed diff columns (`prev_status`/`new_status`/
+`prev_qty`/`new_qty`) and the `STATUS_CHANGE`/`QTY_CHANGE`/`ITEM_CHANGE` types are **gone**, superseded
+by `changes`. The `note` column is a free-text *action* note (from a status/lock/receipt DTO) — a
+line's own `note` is data captured inside `changes`, not here.
 
 **Adding order permissions to a group:** the three permissions (`place_order`, `review_order`,
 `process_order`) are seeded in `scripts/init.sql`; grant them to groups via the existing
@@ -276,11 +330,20 @@ system** — same top-level org-scoped resource shape, same three-role + review/
 row-level scoping, same cursor pagination and audit trail — so most of the order-system notes above
 apply verbatim, with these shipment-specific points:
 
+> **Phase-2 refactor pending — the shipment module is currently stubbed.** The order module moved to
+> line items (`order_details`) in phase 1, and the order header's scalar `qty` column has now been
+> **dropped**. The shipment module used to draw stock from that header (`orders.qty -
+> orders.shipped_qty`), so until it is repointed at `order_details` its qty reads in
+> `shipment.service.ts` are stubbed to `0` — meaning **no stock can be drawn**: creating/locking a
+> shipment against any order is rejected as "0 left to ship". `orders.shipped_qty` and
+> `OrderStatus.COMPLETED` remain as `@deprecated` shipment-only legacy (phase 2 drops them too). The
+> description below is the **intended** shipment behavior, not what the stub currently does.
+
 **Shipment ↔ order is many-to-many.** One shipment can ship (say) 10 units from order A and 20 from
 order B. The per-order quantities live on the `shipment_details` junction (`Shipment.items`), keyed
 `(shipment_id_fk, order_id_fk)` with a `qty` column. A shipment only references orders the placing
-client owns, in the shipment's org, that are `IN_WAREHOUSE` with enough **remaining** qty
-(`orders.qty - orders.shipped_qty`).
+client owns, in the shipment's org, that are `IN_WAREHOUSE` with enough **remaining** qty (this draw is
+what phase 2 will recompute from `order_details`; see the phase-2 note above).
 
 **Three roles + the review/lock gate** (identical structure to orders, resolved by
 `ShipmentService.resolveAccess` via `OrganizationService.hasOrgPermission`):
@@ -314,7 +377,7 @@ orders.
   `SHIPMENT_LOCK` `credit_history` row linked via the new `credit_history.shipment_id_fk`;
 - each line's `qty` is added to its order's `shipped_qty` (each order row locked `FOR UPDATE` and
   re-checked so concurrent locks can't over-ship), and any order whose `shipped_qty` reaches its `qty`
-  is moved to `COMPLETED` with an `order_history` `STATUS_CHANGE` row written by the acting reviewer;
+  is moved to `COMPLETED` with an `order_history` `STATUS_CHANGED` row written by the acting reviewer;
 - a `LOCKED` `shipment_history` row is written.
 
 Cancelling a **locked** shipment (operations) **reverses the deduction**: it subtracts each line's qty
@@ -512,8 +575,8 @@ them into `init.sql` when it is next brought up to date, per **Environment / run
 Postgres schema is `wh` (not `public`); table/column names are snake_case. `scripts/init.sql` is the
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
-`OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `Shipment`, `ShipmentDetail`,
-`ShipmentHistory`, `ShipmentSequence`, `TotalFee`.
+`OrderDetail`, `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `Shipment`,
+`ShipmentDetail`, `ShipmentHistory`, `ShipmentSequence`, `TotalFee`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -531,24 +594,37 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   `group_id_fk, permission_id_fk`).
 
 **Order tables** (entity ↔ table):
-- `Order` → `orders` — an order placed into an org. `order_number` unique per org, `org_id_fk`,
-  `user_id_fk` (the client who placed it), `qty` (numeric), `tracking` (`text`, NOT NULL — the client's
-  free-text carrier reference/URL, supplied at placement), `status` (`CHECK`-constrained), and the
+- `Order` → `orders` — an order **header** placed into an org. `order_number` unique per org
+  (`orders_org_number_unique` on `(org_id_fk, order_number)`), `org_id_fk`, `user_id_fk` (the client
+  who placed it), `tracking` (`text`, NOT NULL — the client's
+  free-text carrier reference/URL, supplied at placement), `status` (`CHECK`-constrained:
+  `IN_TRANSIT` | `IN_WAREHOUSE` | `CANCELLED`, plus the deprecated `COMPLETED` — see below), and the
   review gate `locked` (when and by whom it was locked aren't stored on the order — they're the
   `LOCKED` `order_history` row's `created_at` / `changed_by_fk`). Composite index
   `orders_org_locked_created_idx (org_id_fk, locked, created_at desc, id desc)` backs the operations
-  queue (the `locked = true` keyset scan).
-- `OrderHistory` → `order_history` — append-only audit log (`change_type`, `prev_*`/`new_*` columns;
-  `change_type` is `CREATED` | `STATUS_CHANGE` | `QTY_CHANGE` | `LOCKED`, `CHECK`-constrained).
-  `changed_by_fk` → `wh.users`, exposed both as the raw `changedBy` uuid and as a `changedByUser`
-  `@ManyToOne(User)` relation layered on the same column (loaded, with safe columns only, by
-  `getHistory`).
+  queue (the `locked = true` keyset scan). The header's old scalar `qty` column has been **dropped** —
+  quantity lives on `order_details`. **Deprecated (phase-2 removal):** `shipped_qty`, retained only for
+  the not-yet-refactored (currently stubbed) shipment module; and the `COMPLETED` status value it still
+  references.
+- `OrderDetail` → `order_details` — an order's **line items** (where quantity now lives). `order_id_fk`
+  (→ `orders`, `on delete cascade`), `name` (`varchar(255)` — the client's free text slugified and
+  hyphen-joined to their client `code`, e.g. `ACME-this-is-test`), `qty` (numeric), optional `note`,
+  and `status` (`CHECK`-constrained:
+  `PENDING` | `RECEIVED` | `NOT_ARRIVED` | `CANCELLED` — the per-line receipt lifecycle). Reverse index
+  `order_details_order_idx` on `order_id_fk`.
+- `OrderHistory` → `order_history` — append-only structured change log. `change_type`
+  (`CHECK`-constrained: `CREATED` | `ORDER_UPDATED` | `STATUS_CHANGED` | `LOCKED` | `ITEM_ADDED` |
+  `ITEM_UPDATED` | `ITEM_REMOVED` | `ITEM_RECEIPT`), a `changes` **`jsonb`** before/after payload (see
+  **Change tracking** above), and a free-text `note`. The old typed diff columns
+  (`prev_*`/`new_*`) were dropped. `changed_by_fk` → `wh.users`, exposed both as the raw `changedBy`
+  uuid and as a `changedByUser` `@ManyToOne(User)` relation layered on the same column (loaded, with
+  safe columns only, by `getHistory`).
 - `OrderSequence` → `order_sequences` — per-`(user, org)` order-number counter (composite PK
   `user_id_fk, org_id_fk`); mutated via raw `ON CONFLICT` SQL, not the repository.
-- `users.code` — per-user client code feeding order numbers (unique; NULLs allowed).
-- `orders.shipped_qty` (`numeric`, default 0) — how much of `qty` has been shipped back out via locked
-  shipments; `qty - shipped_qty` is what is still shippable, and the order auto-completes when it
-  reaches `qty`.
+- `users.code` — per-user client code feeding order numbers **and** each line item's `name` prefix
+  (unique; NULLs allowed).
+- `orders.shipped_qty` (`numeric`, default 0) — **deprecated (phase-2 removal)**; shipment-only legacy.
+  See the `Order` note above and the phase-2 note under **Shipment system**.
 
 **Shipment tables** (entity ↔ table; the mirror of the order tables — see **Shipment system** above):
 - `Shipment` → `shipments` — a shipment placed into an org. `shipment_number` unique per org,
@@ -584,9 +660,10 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   `total_fees_order_created_idx` / `total_fees_shipment_created_idx` back the per-target keyset lists.
 
 Note: Postgres `numeric` columns come back as strings from TypeORM — the `Order`/`OrderHistory` qty
-columns (including `orders.shipped_qty`), the `shipment_details`/`ShipmentHistory` qty columns,
-`users.credit`, `org_fees.amount`, `total_fees.amount`, and the `credit_history` amount/balance columns
-all use `numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
+columns (including the deprecated `orders.shipped_qty`), `order_details.qty`, the
+`shipment_details`/`ShipmentHistory` qty columns, `users.credit`, `org_fees.amount`,
+`total_fees.amount`, and the `credit_history` amount/balance columns all use `numericTransformer`
+(`src/entities/numeric.transformer.ts`) to expose them as `number`.
 
 Composite-key join entities map the raw uuid columns with `@PrimaryColumn` and layer the `@ManyToOne`
 relation on the same column via `@JoinColumn` — follow that pattern for new junctions.

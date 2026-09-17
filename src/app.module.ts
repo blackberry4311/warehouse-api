@@ -12,6 +12,7 @@ import { Permission } from './entities/permission.entity';
 import { UserGroup } from './entities/user-group.entity';
 import { GroupPermission } from './entities/group-permission.entity';
 import { Order } from './entities/order.entity';
+import { OrderDetail } from './entities/order-detail.entity';
 import { OrderHistory } from './entities/order-history.entity';
 import { OrderSequence } from './entities/order-sequence.entity';
 import { OrgFee } from './entities/org-fee.entity';
@@ -48,6 +49,7 @@ import { UserModule } from './user/user.module';
           UserGroup,
           GroupPermission,
           Order,
+          OrderDetail,
           OrderHistory,
           OrderSequence,
           OrgFee,

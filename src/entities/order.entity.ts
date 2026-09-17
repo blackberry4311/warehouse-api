@@ -4,25 +4,35 @@ import {
   Entity,
   JoinColumn,
   ManyToOne,
+  OneToMany,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
 import { Organization } from './organization.entity';
 import { User } from './user.entity';
+import { OrderDetail } from './order-detail.entity';
 import { numericTransformer } from './numeric.transformer';
 
-/** The lifecycle a warehouse order moves through. */
+/**
+ * The lifecycle an order **header** moves through. Deliberately just three managed
+ * states: the client places it IN_TRANSIT (goods en route), operations confirms it
+ * into the warehouse (IN_WAREHOUSE — at which point its lines become inventory
+ * items), and it can be CANCELLED from either live state. Per-line receipt is
+ * tracked separately on {@link OrderDetail}.
+ */
 export enum OrderStatus {
-  /** Placed by the client; goods are en route by cargo ship. Client-reported. */
-  SHIPPING = 'SHIPPING',
-  /** Cargo has docked and is on its way to the warehouse. Client-reported. */
-  ARRIVING = 'ARRIVING',
-  /** Operation confirmed the goods and stored them. From here the client can
-   * request a shipment (that flow is future work). */
+  /** Placed by the client; goods are en route. The single initial state. */
+  IN_TRANSIT = 'IN_TRANSIT',
+  /** Operations confirmed the goods and stored them; the lines are now inventory. */
   IN_WAREHOUSE = 'IN_WAREHOUSE',
-  /** Fully withdrawn / closed. */
-  COMPLETED = 'COMPLETED',
   CANCELLED = 'CANCELLED',
+  /**
+   * @deprecated Phase-2 removal. Not part of the order lifecycle any more — retained
+   * on the enum (and the DB CHECK) only because the not-yet-refactored shipment
+   * module still sets it when a shipment ships an order's full quantity. The order
+   * module never transitions to COMPLETED.
+   */
+  COMPLETED = 'COMPLETED',
 }
 
 /** An order placed into the warehouse, scoped to a single organization. */
@@ -42,14 +52,12 @@ export class Order {
   @Column({ type: 'uuid', name: 'user_id_fk' })
   userId: string;
 
-  @Column({ type: 'numeric', transformer: numericTransformer })
-  qty: number;
-
   /**
-   * How much of `qty` has been shipped back out via locked shipments. Starts at 0
-   * and is incremented (per line) when a shipment is locked; `qty - shipped_qty` is
-   * the quantity still available to ship. When it reaches `qty` the order is moved
-   * to COMPLETED. `qty` itself stays the immutable ordered total.
+   * @deprecated Phase-2 removal. Shipment-only legacy: how much has been shipped
+   * back out via locked shipments. The order's quantity now lives per-line on
+   * {@link OrderDetail} — the header's scalar `qty` column has been dropped — so this
+   * counter has nothing to count against until the shipment module is repointed at
+   * the lines (phase 2), which will drop it too.
    */
   @Column({ type: 'numeric', name: 'shipped_qty', default: 0, transformer: numericTransformer })
   shippedQty: number;
@@ -62,15 +70,15 @@ export class Order {
   @Column({ type: 'text' })
   tracking: string;
 
-  @Column({ type: 'varchar', length: 50, default: OrderStatus.SHIPPING })
+  @Column({ type: 'varchar', length: 50, default: OrderStatus.IN_TRANSIT })
   status: OrderStatus;
 
   /**
    * Review gate. A reviewer (`review_order`) locks an order after placement:
    * while unlocked the client may still edit it; once locked the client is frozen
    * out and operations (`process_order`) can see and process it. Orthogonal to
-   * `status` — an order stays in its pending state (SHIPPING/ARRIVING) when locked
-   * until operations moves it into the warehouse.
+   * `status` — an order stays IN_TRANSIT when locked until operations moves it into
+   * the warehouse.
    */
   @Column({ type: 'boolean', default: false })
   locked: boolean;
@@ -82,6 +90,10 @@ export class Order {
   @ManyToOne(() => User, { onUpdate: 'CASCADE' })
   @JoinColumn({ name: 'user_id_fk' })
   user: User;
+
+  /** The order's line items — where the quantity now lives. */
+  @OneToMany(() => OrderDetail, (detail) => detail.order)
+  details: OrderDetail[];
 
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;

@@ -1,10 +1,23 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Param,
+  ParseUUIDPipe,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/interfaces/jwt-payload.interface';
 import { OrderService } from './order.service';
 import { PlaceOrderDto } from './dto/place-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
+import { AddOrderDetailDto } from './dto/add-order-detail.dto';
+import { UpdateOrderDetailDto } from './dto/update-order-detail.dto';
+import { UpdateOrderDetailStatusDto } from './dto/update-order-detail-status.dto';
 import { LockOrderDto } from './dto/lock-order.dto';
 
 @Controller('orders')
@@ -44,6 +57,44 @@ export class OrderController {
     @Body() dto: UpdateOrderDto,
   ) {
     return this.orderService.updateOrder(actor.userId, orderId, dto);
+  }
+
+  @Post(':orderId/details')
+  addDetail(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+    @Body() dto: AddOrderDetailDto,
+  ) {
+    return this.orderService.addDetail(actor.userId, orderId, dto);
+  }
+
+  @Patch(':orderId/details/:detailId')
+  updateDetail(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+    @Param('detailId', ParseUUIDPipe) detailId: string,
+    @Body() dto: UpdateOrderDetailDto,
+  ) {
+    return this.orderService.updateDetail(actor.userId, orderId, detailId, dto);
+  }
+
+  @Patch(':orderId/details/:detailId/status')
+  updateDetailStatus(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+    @Param('detailId', ParseUUIDPipe) detailId: string,
+    @Body() dto: UpdateOrderDetailStatusDto,
+  ) {
+    return this.orderService.updateDetailStatus(actor.userId, orderId, detailId, dto);
+  }
+
+  @Delete(':orderId/details/:detailId')
+  removeDetail(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+    @Param('detailId', ParseUUIDPipe) detailId: string,
+  ) {
+    return this.orderService.removeDetail(actor.userId, orderId, detailId);
   }
 
   @Post(':orderId/lock')

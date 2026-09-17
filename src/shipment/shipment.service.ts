@@ -7,7 +7,6 @@ import {
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, Repository } from 'typeorm';
 import { Order, OrderStatus } from '../entities/order.entity';
-import { OrderChangeType, OrderHistory } from '../entities/order-history.entity';
 import { Shipment, ShipmentStatus } from '../entities/shipment.entity';
 import { ShipmentDetail } from '../entities/shipment-detail.entity';
 import { ShipmentChangeType, ShipmentHistory } from '../entities/shipment-history.entity';
@@ -184,7 +183,11 @@ export class ShipmentService {
           `Order ${order.orderNumber} is not in the warehouse and cannot be shipped`,
         );
       }
-      const remaining = order.qty - order.shippedQty;
+      // Phase-2 stub: the order header's scalar `qty` column has been dropped
+      // (quantity lives on order_details now). Until the shipment module is
+      // repointed at order_details, treat the drawable header qty as 0 — so no
+      // stock can be drawn — keeping this un-refactored path compiling.
+      const remaining = 0 - order.shippedQty;
       if (item.qty > remaining) {
         throw new BadRequestException(
           `Order ${order.orderNumber} has only ${remaining} left to ship (requested ${item.qty})`,
@@ -306,7 +309,7 @@ export class ShipmentService {
       .createQueryBuilder('s')
       .leftJoinAndSelect('s.items', 'item')
       .leftJoin('item.order', 'o')
-      .addSelect(['o.id', 'o.orderNumber', 'o.qty', 'o.shippedQty', 'o.status'])
+      .addSelect(['o.id', 'o.orderNumber', 'o.shippedQty', 'o.status'])
       .where('s.id = :id', { id: shipmentId })
       .getOne();
     if (!shipment) throw new NotFoundException('Shipment not found');
@@ -495,34 +498,21 @@ export class ShipmentService {
             `Order ${order.orderNumber} is no longer in the warehouse and cannot be shipped`,
           );
         }
+        // Phase-2 stub: header `qty` is gone (see createShipment). Treat drawable
+        // header qty as 0 so any draw over-ships and is rejected here, until the
+        // shipment module is repointed at order_details.
         const newShipped = order.shippedQty + item.qty;
-        if (newShipped > order.qty) {
+        if (newShipped > 0) {
           throw new BadRequestException(
-            `Order ${order.orderNumber} would be over-shipped (only ${
-              order.qty - order.shippedQty
-            } left)`,
+            `Order ${order.orderNumber} would be over-shipped (only ${0 - order.shippedQty} left)`,
           );
         }
 
-        const prevStatus = order.status;
+        // Phase-2 stub: with header qty gone, no order auto-completes here, so no
+        // order_history STATUS_CHANGED row is written. Restored when the shipment
+        // module is repointed at order_details.
         order.shippedQty = newShipped;
-        if (newShipped === order.qty) {
-          order.status = OrderStatus.COMPLETED;
-        }
         await em.save(order);
-
-        if (order.status !== prevStatus) {
-          await em.save(
-            em.create(OrderHistory, {
-              orderId: order.id,
-              changedBy: userId,
-              changeType: OrderChangeType.STATUS_CHANGE,
-              prevStatus,
-              newStatus: order.status,
-              note: `Fully shipped by shipment ${shipment.shipmentNumber}`,
-            }),
-          );
-        }
       }
 
       // 3. Lock the shipment and record it.
@@ -582,7 +572,7 @@ export class ShipmentService {
     await this.shipmentRepo.manager.transaction(async (em) => {
       // Cancelling a locked shipment returns its committed qty to the orders.
       if (shipment.locked && dto.status === ShipmentStatus.CANCELLED) {
-        await this.restoreShippedQty(em, shipment, userId);
+        await this.restoreShippedQty(em, shipment);
       }
 
       const prevStatus = shipment.status;
@@ -609,7 +599,7 @@ export class ShipmentService {
    * its order's `shipped_qty`, and revert any order this shipment had completed back
    * to IN_WAREHOUSE. Each order row is locked FOR UPDATE.
    */
-  private async restoreShippedQty(em: EntityManager, shipment: Shipment, actorId: string) {
+  private async restoreShippedQty(em: EntityManager, shipment: Shipment) {
     const items = await em.find(ShipmentDetail, { where: { shipmentId: shipment.id } });
     for (const item of items) {
       const order = await em
@@ -619,25 +609,11 @@ export class ShipmentService {
         .getOne();
       if (!order) continue;
 
-      const prevStatus = order.status;
       order.shippedQty = Math.max(0, order.shippedQty - item.qty);
-      if (order.status === OrderStatus.COMPLETED && order.shippedQty < order.qty) {
-        order.status = OrderStatus.IN_WAREHOUSE;
-      }
+      // Phase-2 stub: header `qty` is gone, so there is no COMPLETED-by-full-ship to
+      // reverse here (see lockShipment), hence no order_history row. Restored when the
+      // shipment module is repointed at order_details.
       await em.save(order);
-
-      if (order.status !== prevStatus) {
-        await em.save(
-          em.create(OrderHistory, {
-            orderId: order.id,
-            changedBy: actorId,
-            changeType: OrderChangeType.STATUS_CHANGE,
-            prevStatus,
-            newStatus: order.status,
-            note: `Shipment ${shipment.shipmentNumber} cancelled`,
-          }),
-        );
-      }
     }
   }
 

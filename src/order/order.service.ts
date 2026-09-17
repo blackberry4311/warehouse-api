@@ -5,9 +5,16 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { Order, OrderStatus } from '../entities/order.entity';
-import { OrderChangeType, OrderHistory } from '../entities/order-history.entity';
+import { OrderDetail, OrderDetailStatus } from '../entities/order-detail.entity';
+import {
+  FieldDiff,
+  OrderChange,
+  OrderChangeType,
+  OrderHistory,
+  OrderItemChange,
+} from '../entities/order-history.entity';
 import { User } from '../entities/user.entity';
 import { FeeType, OrgFee } from '../entities/org-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
@@ -16,41 +23,58 @@ import { OrganizationService } from '../organization/organization.service';
 import { PlaceOrderDto } from './dto/place-order.dto';
 import { UpdateOrderDto } from './dto/update-order.dto';
 import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
+import { AddOrderDetailDto } from './dto/add-order-detail.dto';
+import { UpdateOrderDetailDto } from './dto/update-order-detail.dto';
+import { UpdateOrderDetailStatusDto } from './dto/update-order-detail-status.dto';
 import { LockOrderDto } from './dto/lock-order.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
 
 /**
  * Status moves the **client** (order owner) may make while the order is still
- * unlocked — reporting their shipment's progress between the two pending states,
- * or cancelling. Once a reviewer locks the order the client can no longer act.
+ * unlocked. With the lifecycle simplified to a single initial state, the client can
+ * only cancel a still-in-transit order (line changes go through the /details routes).
  */
 const CLIENT_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
-  [OrderStatus.SHIPPING]: [OrderStatus.ARRIVING, OrderStatus.CANCELLED],
-  [OrderStatus.ARRIVING]: [OrderStatus.SHIPPING, OrderStatus.CANCELLED],
+  [OrderStatus.IN_TRANSIT]: [OrderStatus.CANCELLED],
   [OrderStatus.IN_WAREHOUSE]: [],
-  [OrderStatus.COMPLETED]: [],
   [OrderStatus.CANCELLED]: [],
+  [OrderStatus.COMPLETED]: [],
 };
 
 /**
  * Status moves **operations** (process_order) may make, once the order is locked:
- * the warehouse lifecycle. Operations can push a locked order forward from either
- * pending state into the warehouse, then on to completion. CANCELLED is reachable
- * from any live state; COMPLETED and CANCELLED are terminal.
+ * confirm the goods into the warehouse (at which point the lines become inventory),
+ * or cancel. CANCELLED is reachable from any live state. COMPLETED is shipment-only
+ * legacy and is never a move here.
  */
 const PROCESS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
-  [OrderStatus.SHIPPING]: [OrderStatus.ARRIVING, OrderStatus.IN_WAREHOUSE, OrderStatus.CANCELLED],
-  [OrderStatus.ARRIVING]: [OrderStatus.IN_WAREHOUSE, OrderStatus.CANCELLED],
-  [OrderStatus.IN_WAREHOUSE]: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
-  [OrderStatus.COMPLETED]: [],
+  [OrderStatus.IN_TRANSIT]: [OrderStatus.IN_WAREHOUSE, OrderStatus.CANCELLED],
+  [OrderStatus.IN_WAREHOUSE]: [OrderStatus.CANCELLED],
   [OrderStatus.CANCELLED]: [],
+  [OrderStatus.COMPLETED]: [],
 };
 
-/** The two pending (pre-warehouse) states an order can be locked / edited in. */
-const PENDING_STATUSES: readonly OrderStatus[] = [OrderStatus.SHIPPING, OrderStatus.ARRIVING];
+/**
+ * The receipt transitions operations may drive a line through. PENDING can resolve
+ * to any outcome; RECEIVED/NOT_ARRIVED allow correcting each other; CANCELLED is
+ * terminal for a line.
+ */
+const DETAIL_TRANSITIONS: Record<OrderDetailStatus, OrderDetailStatus[]> = {
+  [OrderDetailStatus.PENDING]: [
+    OrderDetailStatus.RECEIVED,
+    OrderDetailStatus.NOT_ARRIVED,
+    OrderDetailStatus.CANCELLED,
+  ],
+  [OrderDetailStatus.RECEIVED]: [OrderDetailStatus.NOT_ARRIVED, OrderDetailStatus.CANCELLED],
+  [OrderDetailStatus.NOT_ARRIVED]: [OrderDetailStatus.RECEIVED, OrderDetailStatus.CANCELLED],
+  [OrderDetailStatus.CANCELLED]: [],
+};
+
+/** The only state in which an order can be locked / edited pre-lock. */
+const PENDING_STATUSES: readonly OrderStatus[] = [OrderStatus.IN_TRANSIT];
 
 /** Terminal states — no further transitions, no edits. */
-const TERMINAL_STATUSES: readonly OrderStatus[] = [OrderStatus.COMPLETED, OrderStatus.CANCELLED];
+const TERMINAL_STATUSES: readonly OrderStatus[] = [OrderStatus.CANCELLED, OrderStatus.COMPLETED];
 
 const ORDER_STATUS_VALUES = new Set<string>(Object.values(OrderStatus));
 
@@ -87,18 +111,94 @@ interface OrderAccess {
 export class OrderService {
   constructor(
     @InjectRepository(Order) private orderRepo: Repository<Order>,
+    @InjectRepository(OrderDetail) private detailRepo: Repository<OrderDetail>,
     @InjectRepository(OrderHistory) private historyRepo: Repository<OrderHistory>,
     @InjectRepository(TotalFee) private feeRepo: Repository<TotalFee>,
     private readonly orgService: OrganizationService,
   ) {}
 
   /**
+   * Compose a stored line name from the order client's code and their free text:
+   * the free text is slugified (lowercased, each run of non-letter/digit characters
+   * collapsed to a single hyphen, leading/trailing hyphens trimmed) and joined to
+   * the code with a hyphen — e.g. code `ACME` + `"this is test"` → `ACME-this-is-test`.
+   * Unicode letters/digits are preserved (so non-Latin text isn't stripped away). If
+   * the free text slugifies to nothing, the name is just the code.
+   */
+  private composeName(code: string, freeText: string): string {
+    const slug = freeText
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, '-')
+      .replace(/^-+|-+$/gu, '');
+    return slug ? `${code}-${slug}` : code;
+  }
+
+  /**
+   * Ensure a user has a client `code`, assigning one lazily (self-registered users
+   * may lack it). Used both for the order number and the line-name prefix.
+   */
+  private async ensureUserCode(em: EntityManager, userId: string): Promise<string> {
+    const user = await em.findOne(User, { where: { id: userId } });
+    if (!user) throw new NotFoundException('User not found');
+    if (user.code) return user.code;
+    const code = await this.orgService.resolveUserCode(undefined, user.displayName ?? user.email);
+    await em.update(User, { id: userId }, { code });
+    return code;
+  }
+
+  /** Append an `order_history` row with a structured `changes` payload (see
+   * {@link OrderChange}). One row per user action. */
+  private async writeHistory(
+    em: EntityManager,
+    orderId: string,
+    actorId: string,
+    changeType: OrderChangeType,
+    changes: OrderChange | null,
+    note: string | null,
+  ): Promise<void> {
+    await em.save(
+      em.create(OrderHistory, { orderId, changedBy: actorId, changeType, changes, note }),
+    );
+  }
+
+  /** Build the `changes.item` entry for a line: its id + name snapshot, plus any
+   * per-field diffs. */
+  private itemChange(detail: OrderDetail, fields?: Record<string, FieldDiff>): OrderItemChange {
+    return { detailId: detail.id, name: detail.name, ...(fields ? { fields } : {}) };
+  }
+
+  /**
+   * Gate for editing an order or its lines, resolved by the lock state:
+   *   - while **unlocked**, only the owning client may edit, and only while the
+   *     order is still IN_TRANSIT;
+   *   - once **locked**, the client is frozen out and only a reviewer
+   *     (`review_order`) may edit, up until the order reaches a terminal state.
+   */
+  private async assertEditable(order: Order, actorId: string): Promise<void> {
+    if (order.locked) {
+      const access = await this.resolveAccess(order.orgId, actorId);
+      if (!access.canReview) {
+        throw new ForbiddenException('Order is locked; only a reviewer can edit it');
+      }
+      if (TERMINAL_STATUSES.includes(order.status)) {
+        throw new BadRequestException(`Cannot edit an order that is ${order.status}`);
+      }
+    } else {
+      if (order.userId !== actorId) {
+        throw new ForbiddenException('Only the client who placed the order can edit it');
+      }
+      if (order.status !== OrderStatus.IN_TRANSIT) {
+        throw new BadRequestException('Order can only be edited while in transit');
+      }
+    }
+  }
+
+  /**
    * Place a new order into `dto.orgId` as the calling client. The order number is
-   * either supplied by the FE (`dto.orderNumber`, a manual order — used verbatim)
-   * or auto-generated as a per-(user, org) `<user code>-<6-digit seq>`. Creates the
-   * order as SHIPPING (goods en route by cargo ship) and writes a CREATED history
+   * always auto-generated as a per-(user, org) `<user code>-<6-digit seq>`. Creates
+   * the order IN_TRANSIT with its line items (each PENDING) and a CREATED history
    * row — all in one transaction so the number is never a duplicate and an order
-   * always has an opening history entry.
+   * always has an opening history entry and at least one line.
    */
   async placeOrder(userId: string, dto: PlaceOrderDto) {
     const orgId = dto.orgId;
@@ -106,58 +206,64 @@ export class OrderService {
     await this.orgService.assertOrgMembership(orgId, userId);
 
     return this.orderRepo.manager.transaction(async (em) => {
-      let orderNumber: string;
-      const manualNumber = dto.orderNumber?.trim();
-      if (manualNumber) {
-        // Manual order: store the FE-supplied number verbatim, no validation.
-        orderNumber = manualNumber;
-      } else {
-        // Auto-generated: ensure the placing user has a client code (self-registered
-        // users may not), then atomically bump the per-(user, org) counter.
-        const user = await em.findOne(User, { where: { id: userId } });
-        if (!user) throw new NotFoundException('User not found');
-        let code = user.code;
-        if (!code) {
-          code = await this.orgService.resolveUserCode(undefined, user.displayName ?? user.email);
-          await em.update(User, { id: userId }, { code });
-        }
+      const code = await this.ensureUserCode(em, userId);
 
-        const rows: Array<{ next_seq: string }> = await em.query(
-          `INSERT INTO wh.order_sequences (user_id_fk, org_id_fk, next_seq)
-           VALUES ($1, $2, 1)
-           ON CONFLICT (user_id_fk, org_id_fk)
-             DO UPDATE SET next_seq = order_sequences.next_seq + 1
-           RETURNING next_seq`,
-          [userId, orgId],
-        );
-        const seq = Number(rows[0].next_seq);
-        orderNumber = `${code}-${String(seq).padStart(6, '0')}`;
-      }
+      const rows: Array<{ next_seq: string }> = await em.query(
+        `INSERT INTO wh.order_sequences (user_id_fk, org_id_fk, next_seq)
+         VALUES ($1, $2, 1)
+         ON CONFLICT (user_id_fk, org_id_fk)
+           DO UPDATE SET next_seq = order_sequences.next_seq + 1
+         RETURNING next_seq`,
+        [userId, orgId],
+      );
+      const seq = Number(rows[0].next_seq);
+      const orderNumber = `${code}-${String(seq).padStart(6, '0')}`;
 
-      const status = dto.status ?? OrderStatus.SHIPPING;
       const order = await em.save(
         em.create(Order, {
           orderNumber,
           orgId,
           userId,
-          qty: dto.qty,
           tracking: dto.tracking,
-          status,
+          status: OrderStatus.IN_TRANSIT,
         }),
       );
 
-      await em.save(
-        em.create(OrderHistory, {
-          orderId: order.id,
-          changedBy: userId,
-          changeType: OrderChangeType.CREATED,
-          newStatus: status,
-          newQty: dto.qty,
-          note: dto.note ?? null,
-        }),
+      const details = await em.save(
+        dto.details.map((d) =>
+          em.create(OrderDetail, {
+            orderId: order.id,
+            name: this.composeName(code, d.name),
+            qty: d.qty,
+            note: d.note ?? null,
+            status: OrderDetailStatus.PENDING,
+          }),
+        ),
       );
 
-      return order;
+      // CREATED snapshots the header and every line (to-only diffs).
+      const changes: OrderChange = {
+        order: {
+          tracking: { to: order.tracking },
+          status: { to: OrderStatus.IN_TRANSIT },
+        },
+        items: details.map((d) =>
+          this.itemChange(d, {
+            qty: { to: d.qty },
+            ...(d.note !== null ? { note: { to: d.note } } : {}),
+          }),
+        ),
+      };
+      await this.writeHistory(
+        em,
+        order.id,
+        userId,
+        OrderChangeType.CREATED,
+        changes,
+        dto.note ?? null,
+      );
+
+      return { ...order, details };
     });
   }
 
@@ -264,15 +370,19 @@ export class OrderService {
   }
 
   /**
-   * The order-detail read for the FE: the order plus `totalFee`, the running total
-   * the client is charged — the sum of every non-voided fee on it (the protected
-   * lock fee plus any active extra fees; voided fees are refunded so excluded).
-   * Wraps {@link getOrder} for the same authorization/scoping.
+   * The order-detail read for the FE: the order plus its `details` (line items),
+   * `totalQty` (their summed quantity), and `totalFee` — the running total the
+   * client is charged (sum of every non-voided fee). Wraps {@link getOrder} for the
+   * same authorization/scoping.
    */
   async getOrderDetail(userId: string, orderId: string) {
     const order = await this.getOrder(userId, orderId);
-    const totalFee = await this.sumFees(order.id);
-    return { ...order, totalFee };
+    const [details, totalFee] = await Promise.all([
+      this.detailRepo.find({ where: { orderId: order.id }, order: { createdAt: 'ASC' } }),
+      this.sumFees(order.id),
+    ]);
+    const totalQty = details.reduce((sum, d) => sum + d.qty, 0);
+    return { ...order, details, totalQty, totalFee };
   }
 
   /** Sum of the non-voided fees charged against an order (0 when there are none). */
@@ -287,68 +397,199 @@ export class OrderService {
   }
 
   /**
-   * Edit an order's quantity, recording a QTY_CHANGE. Who may edit depends on the
-   * lock gate:
-   *   - while **unlocked**, only the owning client may edit, and only while the
-   *     order is still in a pending (SHIPPING/ARRIVING) state;
-   *   - once **locked**, the client is frozen out and only a reviewer
-   *     (`review_order`) may edit, up until the order reaches a terminal state.
+   * Edit the order **header** — currently just its `tracking` reference. Same lock
+   * gate as line edits (owner pre-lock, reviewer post-lock). Line changes go through
+   * the /details routes, not here.
    */
   async updateOrder(userId: string, orderId: string, dto: UpdateOrderDto) {
     const order = await this.getOrder(userId, orderId);
+    await this.assertEditable(order, userId);
 
-    if (order.locked) {
-      const access = await this.resolveAccess(order.orgId, userId);
-      if (!access.canReview) {
-        throw new ForbiddenException('Order is locked; only a reviewer can edit it');
-      }
-      if (TERMINAL_STATUSES.includes(order.status)) {
-        throw new BadRequestException(`Cannot edit an order that is ${order.status}`);
-      }
-    } else {
-      if (order.userId !== userId) {
-        throw new ForbiddenException('Only the client who placed the order can edit it');
-      }
-      if (!PENDING_STATUSES.includes(order.status)) {
-        throw new BadRequestException('Order can only be edited while shipping or arriving');
-      }
-    }
-    const qtyChanged = dto.qty !== undefined && dto.qty !== order.qty;
-    const trackingChanged = dto.tracking !== undefined && dto.tracking !== order.tracking;
-    if (!qtyChanged && !trackingChanged) {
-      throw new BadRequestException('Nothing to update: qty and tracking are unchanged');
+    if (dto.tracking === order.tracking) {
+      throw new BadRequestException('Nothing to update: tracking is unchanged');
     }
 
     return this.orderRepo.manager.transaction(async (em) => {
-      const prevQty = order.qty;
-      if (qtyChanged) {
-        order.qty = dto.qty as number;
-      }
-      if (trackingChanged) {
-        order.tracking = dto.tracking as string;
-      }
+      const changes: OrderChange = {
+        order: { tracking: { from: order.tracking, to: dto.tracking } },
+      };
+      order.tracking = dto.tracking;
       const saved = await em.save(order);
-
-      await em.save(
-        em.create(OrderHistory, {
-          orderId: order.id,
-          changedBy: userId,
-          changeType: OrderChangeType.QTY_CHANGE,
-          prevQty,
-          newQty: order.qty,
-          note: dto.note ?? null,
-        }),
-      );
-
+      await this.writeHistory(em, order.id, userId, OrderChangeType.ORDER_UPDATED, changes, null);
       return saved;
     });
   }
 
   /**
-   * A reviewer (`review_order`) reviews and locks a freshly placed order, handing
-   * it to operations. Locking freezes the client out of further edits and surfaces
-   * the order into the operations (process_order) queue. Recorded as a LOCKED
-   * history row. Only a still-pending, not-yet-locked order can be locked.
+   * Add a line to an order. Same lock gate as {@link updateOrder}. The new line is
+   * PENDING; `dto.name` is the client's free text, prefixed with the order client's
+   * code. Writes an ITEM_ADDED history row (the new line's fields as to-only diffs).
+   */
+  async addDetail(userId: string, orderId: string, dto: AddOrderDetailDto) {
+    const order = await this.getOrder(userId, orderId);
+    await this.assertEditable(order, userId);
+
+    return this.orderRepo.manager.transaction(async (em) => {
+      const code = await this.ensureUserCode(em, order.userId);
+
+      const detail = await em.save(
+        em.create(OrderDetail, {
+          orderId: order.id,
+          name: this.composeName(code, dto.name),
+          qty: dto.qty,
+          note: dto.note ?? null,
+          status: OrderDetailStatus.PENDING,
+        }),
+      );
+
+      const changes: OrderChange = {
+        item: this.itemChange(detail, {
+          qty: { to: detail.qty },
+          ...(detail.note !== null ? { note: { to: detail.note } } : {}),
+        }),
+      };
+      // The line's own `note` is data (captured in `changes`), not an action note.
+      await this.writeHistory(em, order.id, userId, OrderChangeType.ITEM_ADDED, changes, null);
+      return detail;
+    });
+  }
+
+  /**
+   * Edit a line's name/qty/note (not its receipt status — that is the /status
+   * route). Same lock gate as {@link updateOrder}. Writes an ITEM_UPDATED row whose
+   * `changes.item.fields` carries a from/to for **only** the fields that changed.
+   */
+  async updateDetail(userId: string, orderId: string, detailId: string, dto: UpdateOrderDetailDto) {
+    const order = await this.getOrder(userId, orderId);
+    await this.assertEditable(order, userId);
+
+    if (dto.name === undefined && dto.qty === undefined && dto.note === undefined) {
+      throw new BadRequestException('Nothing to update');
+    }
+
+    const detail = await this.detailRepo.findOne({ where: { id: detailId, orderId: order.id } });
+    if (!detail) throw new NotFoundException('Order line not found');
+    if (detail.status === OrderDetailStatus.CANCELLED) {
+      throw new BadRequestException('Cannot edit a cancelled line');
+    }
+
+    return this.orderRepo.manager.transaction(async (em) => {
+      const code = await this.ensureUserCode(em, order.userId);
+
+      // Diff only the fields that actually change.
+      const fields: Record<string, FieldDiff> = {};
+      if (dto.name !== undefined) {
+        const newName = this.composeName(code, dto.name);
+        if (newName !== detail.name) {
+          fields.name = { from: detail.name, to: newName };
+          detail.name = newName;
+        }
+      }
+      if (dto.qty !== undefined && dto.qty !== detail.qty) {
+        fields.qty = { from: detail.qty, to: dto.qty };
+        detail.qty = dto.qty;
+      }
+      if (dto.note !== undefined && dto.note !== detail.note) {
+        fields.note = { from: detail.note, to: dto.note };
+        detail.note = dto.note;
+      }
+      if (Object.keys(fields).length === 0) {
+        throw new BadRequestException('Nothing to update: the line is unchanged');
+      }
+
+      const saved = await em.save(detail);
+      const changes: OrderChange = { item: this.itemChange(detail, fields) };
+      await this.writeHistory(em, order.id, userId, OrderChangeType.ITEM_UPDATED, changes, null);
+      return saved;
+    });
+  }
+
+  /**
+   * Remove a line from an order. Same lock gate as {@link updateOrder}. An order
+   * must keep at least one line, so removing the last is rejected. Writes an
+   * ITEM_REMOVED row snapshotting the line (with its qty as a from-only diff).
+   */
+  async removeDetail(userId: string, orderId: string, detailId: string) {
+    const order = await this.getOrder(userId, orderId);
+    await this.assertEditable(order, userId);
+
+    const detail = await this.detailRepo.findOne({ where: { id: detailId, orderId: order.id } });
+    if (!detail) throw new NotFoundException('Order line not found');
+
+    const count = await this.detailRepo.count({ where: { orderId: order.id } });
+    if (count <= 1) {
+      throw new BadRequestException('An order must have at least one line');
+    }
+
+    return this.orderRepo.manager.transaction(async (em) => {
+      const changes: OrderChange = {
+        item: this.itemChange(detail, { qty: { from: detail.qty } }),
+      };
+      await em.remove(detail);
+      await this.writeHistory(em, order.id, userId, OrderChangeType.ITEM_REMOVED, changes, null);
+      return { id: detailId, removed: true };
+    });
+  }
+
+  /**
+   * Operations confirms a line's receipt outcome (RECEIVED → inventory, NOT_ARRIVED,
+   * or CANCELLED). Only after the order is locked, only by `process_order`, and only
+   * while the order is not terminal. Writes an ITEM_RECEIPT history row with the
+   * line's status diff.
+   */
+  async updateDetailStatus(
+    userId: string,
+    orderId: string,
+    detailId: string,
+    dto: UpdateOrderDetailStatusDto,
+  ) {
+    const order = await this.getOrder(userId, orderId);
+    if (!order.locked) {
+      throw new BadRequestException('Line receipt can only be set after the order is locked');
+    }
+    const access = await this.resolveAccess(order.orgId, userId);
+    if (!access.canManage) {
+      throw new ForbiddenException("Only operations can set a line's receipt status");
+    }
+    if (TERMINAL_STATUSES.includes(order.status)) {
+      throw new BadRequestException(`Cannot change a line on an order that is ${order.status}`);
+    }
+
+    const detail = await this.detailRepo.findOne({ where: { id: detailId, orderId: order.id } });
+    if (!detail) throw new NotFoundException('Order line not found');
+
+    if (dto.status === detail.status) {
+      throw new BadRequestException(`Line is already ${detail.status}`);
+    }
+    if (!DETAIL_TRANSITIONS[detail.status].includes(dto.status)) {
+      throw new BadRequestException(`Cannot move line from ${detail.status} to ${dto.status}`);
+    }
+
+    return this.orderRepo.manager.transaction(async (em) => {
+      const prev = detail.status;
+      detail.status = dto.status;
+      const saved = await em.save(detail);
+
+      const changes: OrderChange = {
+        item: this.itemChange(detail, { status: { from: prev, to: dto.status } }),
+      };
+      await this.writeHistory(
+        em,
+        order.id,
+        userId,
+        OrderChangeType.ITEM_RECEIPT,
+        changes,
+        dto.note ?? null,
+      );
+      return saved;
+    });
+  }
+
+  /**
+   * A reviewer (`review_order`) reviews and locks a freshly placed (IN_TRANSIT)
+   * order, handing it to operations. Locking freezes the client out of further edits
+   * and surfaces the order into the operations (process_order) queue. Recorded as a
+   * LOCKED history row. Only a still-in-transit, not-yet-locked order can be locked.
    *
    * Locking is also the billing event: the order's **client** (`order.userId`, not
    * the acting reviewer) is charged the org's flat `ORDER_LOCK` fee. The charge, the
@@ -365,7 +606,7 @@ export class OrderService {
       throw new BadRequestException('Order is already locked');
     }
     if (!PENDING_STATUSES.includes(order.status)) {
-      throw new BadRequestException('Only a shipping or arriving order can be reviewed and locked');
+      throw new BadRequestException('Only an in-transit order can be reviewed and locked');
     }
 
     return this.orderRepo.manager.transaction(async (em) => {
@@ -428,13 +669,14 @@ export class OrderService {
 
       // When and by whom it was locked are captured by this LOCKED history row
       // (its `createdAt` and `changedBy`).
-      await em.save(
-        em.create(OrderHistory, {
-          orderId: order.id,
-          changedBy: userId,
-          changeType: OrderChangeType.LOCKED,
-          note: dto.note ?? null,
-        }),
+      const changes: OrderChange = { order: { locked: { from: false, to: true } } };
+      await this.writeHistory(
+        em,
+        order.id,
+        userId,
+        OrderChangeType.LOCKED,
+        changes,
+        dto.note ?? null,
       );
 
       return saved;
@@ -442,10 +684,10 @@ export class OrderService {
   }
 
   /**
-   * Move an order along its lifecycle, recording a STATUS_CHANGE. Who may move it,
+   * Move an order along its lifecycle, recording a STATUS_CHANGED. Who may move it,
    * and to where, depends on the lock gate:
-   *   - while **unlocked**, only the owning client may change status — reporting
-   *     their shipment (SHIPPING ↔ ARRIVING) or cancelling (CLIENT_TRANSITIONS);
+   *   - while **unlocked**, only the owning client may change status — cancelling an
+   *     in-transit order (CLIENT_TRANSITIONS);
    *   - once **locked**, the client is frozen out and only operations
    *     (`process_order`) drives the warehouse lifecycle (PROCESS_TRANSITIONS).
    */
@@ -461,7 +703,7 @@ export class OrderService {
       }
       allowed = PROCESS_TRANSITIONS[order.status];
     } else {
-      // Pre-lock: the client reports shipment progress or cancels.
+      // Pre-lock: the client cancels an in-transit order.
       if (order.userId !== userId) {
         throw new ForbiddenException(
           'Only the client who placed the order can change its status before it is locked',
@@ -482,15 +724,16 @@ export class OrderService {
       order.status = dto.status;
       const saved = await em.save(order);
 
-      await em.save(
-        em.create(OrderHistory, {
-          orderId: order.id,
-          changedBy: userId,
-          changeType: OrderChangeType.STATUS_CHANGE,
-          prevStatus,
-          newStatus: dto.status,
-          note: dto.note ?? null,
-        }),
+      const changes: OrderChange = {
+        order: { status: { from: prevStatus, to: dto.status } },
+      };
+      await this.writeHistory(
+        em,
+        order.id,
+        userId,
+        OrderChangeType.STATUS_CHANGED,
+        changes,
+        dto.note ?? null,
       );
 
       return saved;

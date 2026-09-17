@@ -73,20 +73,22 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   // Three order roles, all three read routes reachable by any of them (the caller
   // needs any one); OrderService applies the row-level scoping:
   //   - `place_order`  — a client: places their own orders, and while the order is
-  //                      still unlocked edits its qty and changes its status
-  //                      (SHIPPING ↔ ARRIVING, or cancel); reads *their own* orders
+  //                      still unlocked edits the header (tracking) and its lines
+  //                      (add/edit/remove) or cancels it; reads *their own* orders
   //                      and history.
   //   - `review_order` — a reviewer: reviews and locks orders (the client/ops
-  //                      handoff), edits a *locked* order's qty (but NOT its
-  //                      status), and reads *every* order in the org.
-  //   - `process_order` — operations: drives a *locked* order's status along the
-  //                      warehouse lifecycle, and reads *every locked* order and
-  //                      its history.
+  //                      handoff), edits a *locked* order's header/lines (but NOT its
+  //                      status or line receipt), and reads *every* order in the org.
+  //   - `process_order` — operations: drives a *locked* order's status into the
+  //                      warehouse, confirms each line's receipt
+  //                      (`.../details/:detailId/status`), and reads *every locked*
+  //                      order and its history.
   //
-  // The two PATCH routes are shared and the effective actor is resolved in
-  // OrderService by the lock gate: `patch /orders/:orderId/status` is the client's
-  // pre-lock or operations' post-lock; `patch /orders/:orderId` is the owner's
-  // pre-lock or the reviewer's post-lock.
+  // The shared PATCH/POST/DELETE routes resolve their effective actor in
+  // OrderService by the lock gate: the order header (`patch /orders/:orderId`) and
+  // line routes (`.../details`, `.../details/:detailId`) are the owner's pre-lock or
+  // the reviewer's post-lock; `patch /orders/:orderId/status` is the client's
+  // pre-lock or operations' post-lock; line receipt is operations-only, post-lock.
   //
   // Extra fees (ad-hoc named charges on an order): only the two staff roles may add
   // or void one; the placing client may also list them (to see what they were
@@ -95,6 +97,9 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'post /orders',
     'patch /orders/:orderId',
     'patch /orders/:orderId/status',
+    'post /orders/:orderId/details',
+    'patch /orders/:orderId/details/:detailId',
+    'delete /orders/:orderId/details/:detailId',
     'get /orders',
     'get /orders/:orderId',
     'get /orders/:orderId/history',
@@ -103,6 +108,9 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   review_order: [
     'post /orders/:orderId/lock',
     'patch /orders/:orderId',
+    'post /orders/:orderId/details',
+    'patch /orders/:orderId/details/:detailId',
+    'delete /orders/:orderId/details/:detailId',
     'get /orders',
     'get /orders/:orderId',
     'get /orders/:orderId/history',
@@ -112,6 +120,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   ],
   process_order: [
     'patch /orders/:orderId/status',
+    'patch /orders/:orderId/details/:detailId/status',
     'get /orders',
     'get /orders/:orderId',
     'get /orders/:orderId/history',
