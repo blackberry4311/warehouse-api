@@ -84,10 +84,10 @@ export class Shipment {
   label?: ShipmentLabel;
 
   /**
-   * Non-persisted, list-only summary of `items`: how many orders this shipment
-   * draws from and their combined qty. Populated by `listShipments` (which does
-   * not load the full line set) so the UI can show them without a per-row fetch;
-   * `undefined` on single-shipment reads, which carry the full `items` instead.
+   * Non-persisted summary of `items`: how many order lines this shipment draws from
+   * and their combined qty. Populated by `listShipments` alongside the full `items`
+   * line set, so the list UI can show the totals on the parent row without re-summing
+   * the detail rows; `undefined` on the single-shipment read, which carries `items`.
    */
   inventoryItemCount?: number;
   totalQty?: number;

@@ -326,33 +326,47 @@ export class ShipmentService {
     }
 
     const page = toPage(await qb.getMany(), limit);
-    await this.attachItemSummary(page.items);
+    await this.attachListItems(page.items);
     return page;
   }
 
   /**
-   * Populate each shipment's list-only `inventoryItemCount` / `totalQty` (how many orders it
-   * draws from and their combined qty) in a single grouped query over the paginated
-   * slice, so the list UI gets them without loading every line set.
+   * Populate each listed shipment's `items` (its detail lines, each with the referenced
+   * order line item's name / qty / shipped_qty / status and its order number) in a single
+   * batched query over the paginated slice, plus the derived `inventoryItemCount` /
+   * `totalQty` summary. The FE renders each shipment as a parent row (date / status /
+   * label) alongside its detail rows (item name / qty) in one grid, so the list carries
+   * the same `items` shape as the single-shipment read — without a per-row fetch.
    */
-  private async attachItemSummary(shipments: Shipment[]): Promise<void> {
+  private async attachListItems(shipments: Shipment[]): Promise<void> {
     if (shipments.length === 0) return;
     const ids = shipments.map((s) => s.id);
-    const rows: Array<{ shipmentId: string; inventoryItemCount: string; totalQty: string }> =
-      await this.shipmentRepo.manager
-        .createQueryBuilder(ShipmentDetail, 'd')
-        .select('d.shipmentId', 'shipmentId')
-        .addSelect('COUNT(*)', 'inventoryItemCount')
-        .addSelect('COALESCE(SUM(d.qty), 0)', 'totalQty')
-        .where('d.shipmentId IN (:...ids)', { ids })
-        .groupBy('d.shipmentId')
-        .getRawMany();
 
-    const summary = new Map(rows.map((r) => [r.shipmentId, r]));
+    // Batch-load every line of the page's shipments, joining the referenced order line
+    // item (and its order) exactly as `getShipment` does, then group back per shipment.
+    const details = await this.shipmentRepo.manager
+      .createQueryBuilder(ShipmentDetail, 'd')
+      .leftJoin('d.orderDetail', 'od')
+      .addSelect(['od.id', 'od.name', 'od.qty', 'od.shippedQty', 'od.status'])
+      .leftJoin('od.order', 'o')
+      .addSelect(['o.id', 'o.orderNumber', 'o.status'])
+      .where('d.shipmentId IN (:...ids)', { ids })
+      .orderBy('o.orderNumber', 'ASC')
+      .addOrderBy('od.name', 'ASC')
+      .getMany();
+
+    const byShipment = new Map<string, ShipmentDetail[]>();
+    for (const d of details) {
+      const list = byShipment.get(d.shipmentId) ?? [];
+      list.push(d);
+      byShipment.set(d.shipmentId, list);
+    }
+
     for (const s of shipments) {
-      const row = summary.get(s.id);
-      s.inventoryItemCount = row ? Number(row.inventoryItemCount) : 0;
-      s.totalQty = row ? Number(row.totalQty) : 0;
+      const items = byShipment.get(s.id) ?? [];
+      s.items = items;
+      s.inventoryItemCount = items.length;
+      s.totalQty = items.reduce((sum, i) => sum + Number(i.qty), 0);
     }
 
     // Flag which shipments have a label attached (one batched query), so the list UI
