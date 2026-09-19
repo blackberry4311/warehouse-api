@@ -768,7 +768,7 @@ export class OrderService {
     });
   }
 
-  /** An order's audit trail, oldest first, keyset-paginated by (created_at, id). */
+  /** An order's audit trail, newest first, keyset-paginated by (created_at, id). */
   async getHistory(
     userId: string,
     orderId: string,
@@ -783,13 +783,13 @@ export class OrderService {
       .leftJoin('h.changedByUser', 'u')
       .addSelect(['u.id', 'u.displayName', 'u.email', 'u.code'])
       .where('h.orderId = :orderId', { orderId })
-      .orderBy('h.createdAt', 'ASC')
-      .addOrderBy('h.id', 'ASC')
+      .orderBy('h.createdAt', 'DESC')
+      .addOrderBy('h.id', 'DESC')
       .take(limit + 1);
 
     if (cursor) {
       const { t, id } = decodeCursor(cursor);
-      qb.andWhere('(h.createdAt > :t OR (h.createdAt = :t AND h.id > :id))', {
+      qb.andWhere('(h.createdAt < :t OR (h.createdAt = :t AND h.id < :id))', {
         t: new Date(t),
         id,
       });

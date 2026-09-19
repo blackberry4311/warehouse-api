@@ -830,7 +830,7 @@ export class ShipmentService {
     return stale.length;
   }
 
-  /** A shipment's audit trail, oldest first, keyset-paginated by (created_at, id). */
+  /** A shipment's audit trail, newest first, keyset-paginated by (created_at, id). */
   async getHistory(
     userId: string,
     shipmentId: string,
@@ -845,13 +845,13 @@ export class ShipmentService {
       .leftJoin('h.changedByUser', 'u')
       .addSelect(['u.id', 'u.displayName', 'u.email', 'u.code'])
       .where('h.shipmentId = :shipmentId', { shipmentId })
-      .orderBy('h.createdAt', 'ASC')
-      .addOrderBy('h.id', 'ASC')
+      .orderBy('h.createdAt', 'DESC')
+      .addOrderBy('h.id', 'DESC')
       .take(limit + 1);
 
     if (cursor) {
       const { t, id } = decodeCursor(cursor);
-      qb.andWhere('(h.createdAt > :t OR (h.createdAt = :t AND h.id > :id))', {
+      qb.andWhere('(h.createdAt < :t OR (h.createdAt = :t AND h.id < :id))', {
         t: new Date(t),
         id,
       });
