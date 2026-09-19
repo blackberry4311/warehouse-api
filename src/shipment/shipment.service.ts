@@ -6,15 +6,25 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { EntityManager, Repository } from 'typeorm';
-import { Order, OrderStatus } from '../entities/order.entity';
+import { OrderDetail, OrderDetailStatus } from '../entities/order-detail.entity';
 import { Shipment, ShipmentStatus } from '../entities/shipment.entity';
 import { ShipmentDetail } from '../entities/shipment-detail.entity';
-import { ShipmentChangeType, ShipmentHistory } from '../entities/shipment-history.entity';
+import { ShipmentLabel } from '../entities/shipment-label.entity';
+import {
+  ShipmentChange,
+  ShipmentChangeType,
+  ShipmentHistory,
+  ShipmentItemChange,
+} from '../entities/shipment-history.entity';
+import { FieldDiff } from '../entities/order-history.entity';
 import { User } from '../entities/user.entity';
 import { FeeType, OrgFee } from '../entities/org-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
 import { TotalFee } from '../entities/total-fee.entity';
 import { OrganizationService } from '../organization/organization.service';
+import { StorageService } from '../storage/storage.service';
+import { UploadedFile } from '../common/uploaded-file.util';
+import { LABEL_URL_TTL_SECONDS } from '../common/shipment-label.util';
 import { PlaceShipmentDto } from './dto/place-shipment.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
 import { LockShipmentDto } from './dto/lock-shipment.dto';
@@ -24,17 +34,23 @@ import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.uti
 
 /** Status moves the **client** (owner) may make while the shipment is unlocked. */
 const CLIENT_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
-  [ShipmentStatus.REQUESTED]: [ShipmentStatus.CANCELLED],
-  [ShipmentStatus.DELIVERED]: [],
+  [ShipmentStatus.AWAITING]: [ShipmentStatus.CANCELLED],
+  [ShipmentStatus.DONE]: [],
   [ShipmentStatus.CANCELLED]: [],
 };
 
 /** Status moves **operations** (process_shipment) may make once the shipment is locked. */
 const PROCESS_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
-  [ShipmentStatus.REQUESTED]: [ShipmentStatus.DELIVERED, ShipmentStatus.CANCELLED],
-  [ShipmentStatus.DELIVERED]: [],
+  [ShipmentStatus.AWAITING]: [ShipmentStatus.DONE, ShipmentStatus.CANCELLED],
+  [ShipmentStatus.DONE]: [],
   [ShipmentStatus.CANCELLED]: [],
 };
+
+/** Terminal shipment states — a label is useless once here, so the cleanup drops it. */
+const SHIPMENT_TERMINAL_STATUSES: readonly ShipmentStatus[] = [
+  ShipmentStatus.DONE,
+  ShipmentStatus.CANCELLED,
+];
 
 const SHIPMENT_STATUS_VALUES = new Set<string>(Object.values(ShipmentStatus));
 
@@ -73,14 +89,16 @@ export class ShipmentService {
     @InjectRepository(Shipment) private shipmentRepo: Repository<Shipment>,
     @InjectRepository(ShipmentHistory) private historyRepo: Repository<ShipmentHistory>,
     @InjectRepository(TotalFee) private feeRepo: Repository<TotalFee>,
+    @InjectRepository(ShipmentLabel) private labelRepo: Repository<ShipmentLabel>,
     private readonly orgService: OrganizationService,
+    private readonly storage: StorageService,
   ) {}
 
   /**
    * Place a shipment request into `dto.orgId` as the calling client: withdraw the
-   * given quantities out of one or more of the caller's warehoused orders. The
+   * given quantities out of one or more of the caller's warehoused order line items. The
    * shipment number is auto-generated per-(user, org) as `<user code>-S<6-digit seq>`.
-   * Created as REQUESTED and unlocked; no stock is moved and no fee is charged until
+   * Created as AWAITING and unlocked; no stock is moved and no fee is charged until
    * a reviewer locks it. All in one transaction, so the number is never duplicated
    * and the shipment always has an opening CREATED history entry.
    */
@@ -91,7 +109,7 @@ export class ShipmentService {
 
     return this.shipmentRepo.manager.transaction(async (em) => {
       // Validate the requested lines against the caller's warehoused orders.
-      await this.validateItems(em, orgId, userId, dto.items);
+      const details = await this.validateItems(em, orgId, userId, dto.items);
 
       // Ensure the placing user has a client code, then bump the per-(user, org)
       // shipment counter atomically.
@@ -119,8 +137,7 @@ export class ShipmentService {
           shipmentNumber,
           orgId,
           userId,
-          status: ShipmentStatus.REQUESTED,
-          tracking: dto.tracking ?? null,
+          status: ShipmentStatus.AWAITING,
         }),
       );
 
@@ -128,21 +145,26 @@ export class ShipmentService {
         dto.items.map((item) =>
           em.create(ShipmentDetail, {
             shipmentId: shipment.id,
-            orderId: item.orderId,
+            orderDetailId: item.orderDetailId,
             qty: item.qty,
           }),
         ),
       );
 
-      await em.save(
-        em.create(ShipmentHistory, {
-          shipmentId: shipment.id,
-          changedBy: userId,
-          changeType: ShipmentChangeType.CREATED,
-          newStatus: ShipmentStatus.REQUESTED,
-          newQty: totalQty(dto.items),
-          note: dto.note ?? null,
-        }),
+      // CREATED snapshots the header status and every line (to-only diffs).
+      const changes: ShipmentChange = {
+        shipment: { status: { to: ShipmentStatus.AWAITING } },
+        items: dto.items.map((item) =>
+          this.shipmentItemChange(details.get(item.orderDetailId)!, { qty: { to: item.qty } }),
+        ),
+      };
+      await this.writeHistory(
+        em,
+        shipment.id,
+        userId,
+        ShipmentChangeType.CREATED,
+        changes,
+        dto.note ?? null,
       );
 
       shipment.items = items;
@@ -151,49 +173,85 @@ export class ShipmentService {
   }
 
   /**
-   * Validate a shipment's requested lines: no duplicate orders, and every order is
-   * one the caller placed, in `orgId`, IN_WAREHOUSE, with enough remaining qty. Used
-   * by placement and edit (a soft check — the lock re-checks under a row lock).
+   * Validate a shipment's requested lines: no duplicate line items, and every line is
+   * one the caller placed (its order is theirs), in `orgId`, RECEIVED (warehoused
+   * inventory), with enough remaining qty (`qty - shipped_qty`). Used by placement and
+   * edit (a soft check — the lock re-checks each line under a row lock). Returns the
+   * loaded `order_details` (with their order), keyed by id, so the caller can snapshot
+   * line names / order numbers into the history payload without re-querying.
    */
   private async validateItems(
     em: EntityManager,
     orgId: string,
     userId: string,
     items: ShipmentItemDto[],
-  ): Promise<void> {
-    const seen = new Set<string>();
+  ): Promise<Map<string, OrderDetail>> {
+    const details = new Map<string, OrderDetail>();
     for (const item of items) {
-      if (seen.has(item.orderId)) {
-        throw new BadRequestException(`Order ${item.orderId} is listed more than once`);
+      if (details.has(item.orderDetailId)) {
+        throw new BadRequestException(`Line item ${item.orderDetailId} is listed more than once`);
       }
-      seen.add(item.orderId);
 
-      const order = await em.findOne(Order, { where: { id: item.orderId } });
-      if (!order) throw new NotFoundException(`Order ${item.orderId} not found`);
+      const detail = await em.findOne(OrderDetail, {
+        where: { id: item.orderDetailId },
+        relations: { order: true },
+      });
+      if (!detail) throw new NotFoundException(`Line item ${item.orderDetailId} not found`);
+      const order = detail.order;
       if (order.orgId !== orgId) {
         throw new BadRequestException(
-          `Order ${order.orderNumber} does not belong to this organization`,
+          `Line item ${detail.name} does not belong to this organization`,
         );
       }
       if (order.userId !== userId) {
-        throw new ForbiddenException(`You can only ship orders you placed (${order.orderNumber})`);
+        throw new ForbiddenException(`You can only ship line items you placed (${detail.name})`);
       }
-      if (order.status !== OrderStatus.IN_WAREHOUSE) {
+      if (detail.status !== OrderDetailStatus.RECEIVED) {
         throw new BadRequestException(
-          `Order ${order.orderNumber} is not in the warehouse and cannot be shipped`,
+          `Line item ${detail.name} is not warehoused inventory and cannot be shipped`,
         );
       }
-      // Phase-2 stub: the order header's scalar `qty` column has been dropped
-      // (quantity lives on order_details now). Until the shipment module is
-      // repointed at order_details, treat the drawable header qty as 0 — so no
-      // stock can be drawn — keeping this un-refactored path compiling.
-      const remaining = 0 - order.shippedQty;
+      const remaining = detail.qty - detail.shippedQty;
       if (item.qty > remaining) {
         throw new BadRequestException(
-          `Order ${order.orderNumber} has only ${remaining} left to ship (requested ${item.qty})`,
+          `Line item ${detail.name} has only ${remaining} left to ship (requested ${item.qty})`,
         );
       }
+
+      details.set(item.orderDetailId, detail);
     }
+    return details;
+  }
+
+  /** Append a `shipment_history` row with a structured `changes` payload (see
+   * {@link ShipmentChange}). One row per user action — the mirror of the order log. */
+  private async writeHistory(
+    em: EntityManager,
+    shipmentId: string,
+    actorId: string,
+    changeType: ShipmentChangeType,
+    changes: ShipmentChange | null,
+    note: string | null,
+  ): Promise<void> {
+    await em.save(
+      em.create(ShipmentHistory, { shipmentId, changedBy: actorId, changeType, changes, note }),
+    );
+  }
+
+  /**
+   * Build a `changes` line entry: the order line item's id + a name / order-number
+   * snapshot (so a removed line still renders), plus any per-field diffs (`qty`).
+   */
+  private shipmentItemChange(
+    detail: OrderDetail,
+    fields?: Record<string, FieldDiff>,
+  ): ShipmentItemChange {
+    return {
+      orderDetailId: detail.id,
+      name: detail.name,
+      ...(detail.order?.orderNumber ? { orderNumber: detail.order.orderNumber } : {}),
+      ...(fields ? { fields } : {}),
+    };
   }
 
   /**
@@ -273,18 +331,18 @@ export class ShipmentService {
   }
 
   /**
-   * Populate each shipment's list-only `orderCount` / `totalQty` (how many orders it
+   * Populate each shipment's list-only `inventoryItemCount` / `totalQty` (how many orders it
    * draws from and their combined qty) in a single grouped query over the paginated
    * slice, so the list UI gets them without loading every line set.
    */
   private async attachItemSummary(shipments: Shipment[]): Promise<void> {
     if (shipments.length === 0) return;
     const ids = shipments.map((s) => s.id);
-    const rows: Array<{ shipmentId: string; orderCount: string; totalQty: string }> =
+    const rows: Array<{ shipmentId: string; inventoryItemCount: string; totalQty: string }> =
       await this.shipmentRepo.manager
         .createQueryBuilder(ShipmentDetail, 'd')
         .select('d.shipmentId', 'shipmentId')
-        .addSelect('COUNT(*)', 'orderCount')
+        .addSelect('COUNT(*)', 'inventoryItemCount')
         .addSelect('COALESCE(SUM(d.qty), 0)', 'totalQty')
         .where('d.shipmentId IN (:...ids)', { ids })
         .groupBy('d.shipmentId')
@@ -293,8 +351,20 @@ export class ShipmentService {
     const summary = new Map(rows.map((r) => [r.shipmentId, r]));
     for (const s of shipments) {
       const row = summary.get(s.id);
-      s.orderCount = row ? Number(row.orderCount) : 0;
+      s.inventoryItemCount = row ? Number(row.inventoryItemCount) : 0;
       s.totalQty = row ? Number(row.totalQty) : 0;
+    }
+
+    // Flag which shipments have a label attached (one batched query), so the list UI
+    // can show a "label ready to print" marker without loading the label rows.
+    const labelled = await this.labelRepo
+      .createQueryBuilder('l')
+      .select('l.shipmentId', 'shipmentId')
+      .where('l.shipmentId IN (:...ids)', { ids })
+      .getRawMany<{ shipmentId: string }>();
+    const withLabel = new Set(labelled.map((l) => l.shipmentId));
+    for (const s of shipments) {
+      s.hasLabel = withLabel.has(s.id);
     }
   }
 
@@ -308,8 +378,12 @@ export class ShipmentService {
     const shipment = await this.shipmentRepo
       .createQueryBuilder('s')
       .leftJoinAndSelect('s.items', 'item')
-      .leftJoin('item.order', 'o')
-      .addSelect(['o.id', 'o.orderNumber', 'o.shippedQty', 'o.status'])
+      .leftJoin('item.orderDetail', 'd')
+      .addSelect(['d.id', 'd.name', 'd.qty', 'd.shippedQty', 'd.status'])
+      .leftJoin('d.order', 'o')
+      .addSelect(['o.id', 'o.orderNumber', 'o.status'])
+      .leftJoin('s.label', 'label')
+      .addSelect('label.id')
       .where('s.id = :id', { id: shipmentId })
       .getOne();
     if (!shipment) throw new NotFoundException('Shipment not found');
@@ -322,6 +396,10 @@ export class ShipmentService {
       (access.canManage && shipment.locked) ||
       (access.canPlace && shipment.userId === userId);
     if (!visible) throw new NotFoundException('Shipment not found');
+
+    // Collapse the label relation to a flag; never expose the storage key.
+    shipment.hasLabel = shipment.label != null;
+    delete shipment.label;
 
     return shipment;
   }
@@ -350,9 +428,10 @@ export class ShipmentService {
   }
 
   /**
-   * Edit an unlocked (REQUESTED) shipment's line items and/or tracking. Only the
-   * owning client may edit, and only before a reviewer locks it. Supplying `items`
-   * replaces the entire line set. Records an ITEM_CHANGE history row.
+   * Edit an unlocked (AWAITING) shipment's line items — `dto.items` **replaces** the
+   * entire line set. Only the owning client may edit, and only before a reviewer locks
+   * it. Records an ITEM_CHANGE history row. (The shipping label is managed through the
+   * dedicated /label routes.)
    */
   async updateShipment(userId: string, shipmentId: string, dto: UpdateShipmentDto) {
     const shipment = await this.getShipment(userId, shipmentId);
@@ -363,63 +442,75 @@ export class ShipmentService {
     if (shipment.userId !== userId) {
       throw new ForbiddenException('Only the client who placed the shipment can edit it');
     }
-    if (shipment.status !== ShipmentStatus.REQUESTED) {
-      throw new BadRequestException('Only a requested shipment can be edited');
-    }
-
-    const itemsChanged = dto.items !== undefined;
-    const trackingChanged = dto.tracking !== undefined && dto.tracking !== shipment.tracking;
-    if (!itemsChanged && !trackingChanged) {
-      throw new BadRequestException('Nothing to update: items and tracking are unchanged');
+    if (shipment.status !== ShipmentStatus.AWAITING) {
+      throw new BadRequestException('Only an awaiting shipment can be edited');
     }
 
     await this.shipmentRepo.manager.transaction(async (em) => {
-      const prevQty = totalQty(shipment.items);
+      const details = await this.validateItems(em, shipment.orgId, userId, dto.items);
 
-      if (dto.items) {
-        await this.validateItems(em, shipment.orgId, userId, dto.items);
-        // Replace the line set: drop the old rows, insert the new ones.
-        await em.delete(ShipmentDetail, { shipmentId: shipment.id });
-        await em.save(
-          dto.items.map((item) =>
-            em.create(ShipmentDetail, {
-              shipmentId: shipment.id,
-              orderId: item.orderId,
-              qty: item.qty,
-            }),
-          ),
+      // Replace the line set: drop the old rows, insert the new ones.
+      await em.delete(ShipmentDetail, { shipmentId: shipment.id });
+      await em.save(
+        dto.items.map((item) =>
+          em.create(ShipmentDetail, {
+            shipmentId: shipment.id,
+            orderDetailId: item.orderDetailId,
+            qty: item.qty,
+          }),
+        ),
+      );
+
+      // Diff the old line set against the new one and record a single ITEMS_CHANGED
+      // summary row per edit; `changes.items` carries every line that changed — added
+      // (to-only), qty-updated (from+to), or removed (from-only).
+      const oldByDetail = new Map(shipment.items.map((i) => [i.orderDetailId, i]));
+      const newByDetail = new Map(dto.items.map((i) => [i.orderDetailId, i]));
+      const changedItems: ShipmentItemChange[] = [];
+
+      for (const old of shipment.items) {
+        if (!newByDetail.has(old.orderDetailId)) {
+          changedItems.push(this.shipmentItemChange(old.orderDetail, { qty: { from: old.qty } }));
+        }
+      }
+      for (const item of dto.items) {
+        const old = oldByDetail.get(item.orderDetailId);
+        const detail = details.get(item.orderDetailId)!;
+        if (!old) {
+          changedItems.push(this.shipmentItemChange(detail, { qty: { to: item.qty } }));
+        } else if (old.qty !== item.qty) {
+          changedItems.push(
+            this.shipmentItemChange(detail, { qty: { from: old.qty, to: item.qty } }),
+          );
+        }
+      }
+
+      if (changedItems.length > 0) {
+        const changes: ShipmentChange = { items: changedItems };
+        await this.writeHistory(
+          em,
+          shipment.id,
+          userId,
+          ShipmentChangeType.ITEMS_CHANGED,
+          changes,
+          dto.note ?? null,
         );
       }
-      if (trackingChanged) {
-        shipment.tracking = dto.tracking as string;
-        await em.save(shipment);
-      }
-
-      await em.save(
-        em.create(ShipmentHistory, {
-          shipmentId: shipment.id,
-          changedBy: userId,
-          changeType: ShipmentChangeType.ITEM_CHANGE,
-          prevQty,
-          newQty: dto.items ? totalQty(dto.items) : prevQty,
-          note: dto.note ?? null,
-        }),
-      );
     });
 
     return this.getShipment(userId, shipment.id);
   }
 
   /**
-   * A reviewer (`review_shipment`) reviews and locks a REQUESTED shipment, handing
+   * A reviewer (`review_shipment`) reviews and locks an AWAITING shipment, handing
    * it to operations. Locking is the billing + fulfilment event, all in one
    * transaction:
    *   - the shipment's **client** (`shipment.userId`) is charged the org's flat
    *     `SHIPMENT_LOCK` fee (row locked FOR UPDATE; rejected if credit can't
    *     cover it; an org with no fee configured is charged nothing);
-   *   - each line's qty is added to its order's `shipped_qty` (each order row locked
-   *     FOR UPDATE and re-checked so concurrent locks can't over-ship), and an order
-   *     whose `shipped_qty` reaches its `qty` is moved to COMPLETED;
+   *   - each line's qty is added to the order line item's `shipped_qty` (each
+   *     `order_details` row locked FOR UPDATE and re-checked so concurrent locks can't
+   *     over-ship); the order header is never touched;
    *   - a LOCKED history row is written.
    */
   async lockShipment(userId: string, shipmentId: string, dto: LockShipmentDto) {
@@ -428,8 +519,8 @@ export class ShipmentService {
     if (shipment.locked) {
       throw new BadRequestException('Shipment is already locked');
     }
-    if (shipment.status !== ShipmentStatus.REQUESTED) {
-      throw new BadRequestException('Only a requested shipment can be reviewed and locked');
+    if (shipment.status !== ShipmentStatus.AWAITING) {
+      throw new BadRequestException('Only an awaiting shipment can be reviewed and locked');
     }
 
     await this.shipmentRepo.manager.transaction(async (em) => {
@@ -484,48 +575,47 @@ export class ShipmentService {
         );
       }
 
-      // 2. Deduct each line's qty from its order, completing fully-shipped orders.
+      // 2. Deduct each line's qty from the order line item it draws from. Each
+      //    order_details row is locked FOR UPDATE and re-checked so two concurrent
+      //    locks can't over-ship the same inventory. The order header is never touched.
       const items = await em.find(ShipmentDetail, { where: { shipmentId: shipment.id } });
       for (const item of items) {
-        const order = await em
-          .createQueryBuilder(Order, 'o')
+        const detail = await em
+          .createQueryBuilder(OrderDetail, 'd')
           .setLock('pessimistic_write')
-          .where('o.id = :id', { id: item.orderId })
+          .where('d.id = :id', { id: item.orderDetailId })
           .getOne();
-        if (!order) throw new NotFoundException(`Order ${item.orderId} not found`);
-        if (order.status !== OrderStatus.IN_WAREHOUSE) {
+        if (!detail) throw new NotFoundException(`Line item ${item.orderDetailId} not found`);
+        if (detail.status !== OrderDetailStatus.RECEIVED) {
           throw new BadRequestException(
-            `Order ${order.orderNumber} is no longer in the warehouse and cannot be shipped`,
+            `Line item ${detail.name} is no longer warehoused inventory and cannot be shipped`,
           );
         }
-        // Phase-2 stub: header `qty` is gone (see createShipment). Treat drawable
-        // header qty as 0 so any draw over-ships and is rejected here, until the
-        // shipment module is repointed at order_details.
-        const newShipped = order.shippedQty + item.qty;
-        if (newShipped > 0) {
+        const newShipped = detail.shippedQty + item.qty;
+        if (newShipped > detail.qty) {
           throw new BadRequestException(
-            `Order ${order.orderNumber} would be over-shipped (only ${0 - order.shippedQty} left)`,
+            `Line item ${detail.name} would be over-shipped (only ${
+              detail.qty - detail.shippedQty
+            } left)`,
           );
         }
 
-        // Phase-2 stub: with header qty gone, no order auto-completes here, so no
-        // order_history STATUS_CHANGED row is written. Restored when the shipment
-        // module is repointed at order_details.
-        order.shippedQty = newShipped;
-        await em.save(order);
+        detail.shippedQty = newShipped;
+        await em.save(detail);
       }
 
       // 3. Lock the shipment and record it.
       shipment.locked = true;
       await em.save(shipment);
 
-      await em.save(
-        em.create(ShipmentHistory, {
-          shipmentId: shipment.id,
-          changedBy: userId,
-          changeType: ShipmentChangeType.LOCKED,
-          note: dto.note ?? null,
-        }),
+      const changes: ShipmentChange = { shipment: { locked: { from: false, to: true } } };
+      await this.writeHistory(
+        em,
+        shipment.id,
+        userId,
+        ShipmentChangeType.LOCKED,
+        changes,
+        dto.note ?? null,
       );
     });
 
@@ -533,13 +623,12 @@ export class ShipmentService {
   }
 
   /**
-   * Move a shipment's status, recording a STATUS_CHANGE. Split by the lock gate:
-   *   - while **unlocked**, only the owning client may act — cancelling a REQUESTED
+   * Move a shipment's status, recording a STATUS_CHANGED. Split by the lock gate:
+   *   - while **unlocked**, only the owning client may act — cancelling an AWAITING
    *     shipment (nothing was deducted, so nothing is restored);
    *   - once **locked**, only operations (`process_shipment`) may act — marking it
-   *     DELIVERED, or CANCELLED (which returns the shipped qty to its orders,
-   *     reverting any order it had completed back to IN_WAREHOUSE). The fee is not
-   *     refunded.
+   *     DONE, or CANCELLED (which returns the shipped qty to the order line items
+   *     it drew from). The fee is not refunded.
    */
   async updateStatus(userId: string, shipmentId: string, dto: UpdateShipmentStatusDto) {
     const shipment = await this.getShipment(userId, shipmentId);
@@ -579,15 +668,16 @@ export class ShipmentService {
       shipment.status = dto.status;
       await em.save(shipment);
 
-      await em.save(
-        em.create(ShipmentHistory, {
-          shipmentId: shipment.id,
-          changedBy: userId,
-          changeType: ShipmentChangeType.STATUS_CHANGE,
-          prevStatus,
-          newStatus: dto.status,
-          note: dto.note ?? null,
-        }),
+      const changes: ShipmentChange = {
+        shipment: { status: { from: prevStatus, to: dto.status } },
+      };
+      await this.writeHistory(
+        em,
+        shipment.id,
+        userId,
+        ShipmentChangeType.STATUS_CHANGED,
+        changes,
+        dto.note ?? null,
       );
     });
 
@@ -596,25 +686,134 @@ export class ShipmentService {
 
   /**
    * Reverse a locked shipment's stock deduction: subtract each line's qty back from
-   * its order's `shipped_qty`, and revert any order this shipment had completed back
-   * to IN_WAREHOUSE. Each order row is locked FOR UPDATE.
+   * the order line item's `shipped_qty`, returning it to available inventory. Each
+   * `order_details` row is locked FOR UPDATE.
    */
   private async restoreShippedQty(em: EntityManager, shipment: Shipment) {
     const items = await em.find(ShipmentDetail, { where: { shipmentId: shipment.id } });
     for (const item of items) {
-      const order = await em
-        .createQueryBuilder(Order, 'o')
+      const detail = await em
+        .createQueryBuilder(OrderDetail, 'd')
         .setLock('pessimistic_write')
-        .where('o.id = :id', { id: item.orderId })
+        .where('d.id = :id', { id: item.orderDetailId })
         .getOne();
-      if (!order) continue;
+      if (!detail) continue;
 
-      order.shippedQty = Math.max(0, order.shippedQty - item.qty);
-      // Phase-2 stub: header `qty` is gone, so there is no COMPLETED-by-full-ship to
-      // reverse here (see lockShipment), hence no order_history row. Restored when the
-      // shipment module is repointed at order_details.
-      await em.save(order);
+      detail.shippedQty = Math.max(0, detail.shippedQty - item.qty);
+      await em.save(detail);
     }
+  }
+
+  // --- Shipping label (printable image) -----------------------------------
+
+  /**
+   * Attach (or replace) the shipping-label image on a shipment. The owning **client**
+   * provides the label the warehouse prints. One label per shipment: a re-upload
+   * deletes the previous object first. Allowed only while the shipment is not terminal
+   * (DONE/CANCELLED). Gated by `place_shipment` (see PERMISSION_API_MAP); `getShipment`
+   * already restricts a client to their own shipments, and we re-assert ownership here.
+   */
+  async setLabel(userId: string, shipmentId: string, file: UploadedFile) {
+    const shipment = await this.getShipment(userId, shipmentId);
+    this.assertLabelEditable(shipment, userId);
+
+    const existing = await this.labelRepo.findOne({ where: { shipmentId: shipment.id } });
+    const previousKey = existing?.objectKey;
+    const key = this.storage.buildKey('shipment-labels', file.filename, shipment.id);
+    await this.storage.put(key, file.buffer, file.mimetype);
+
+    const label = this.labelRepo.create({
+      id: existing?.id,
+      shipmentId: shipment.id,
+      objectKey: key,
+      contentType: file.mimetype,
+      size: file.size,
+    });
+    const saved = await this.labelRepo.save(label);
+
+    // Best-effort: drop the old object only after the new key is safely committed, so
+    // a failed delete can never leave the row pointing at nothing.
+    if (previousKey && previousKey !== key) await this.storage.delete(previousKey);
+
+    return {
+      shipmentId: shipment.id,
+      contentType: saved.contentType,
+      size: saved.size,
+      uploadedAt: saved.createdAt,
+    };
+  }
+
+  /**
+   * Issue a **presigned URL** for a shipment's label so the browser (or the warehouse
+   * print machine) loads it straight from the bucket — no bytes through the API. Valid
+   * for `LABEL_URL_TTL_SECONDS`. Readable by anyone who can see the shipment (client /
+   * reviewer / operations — the same scoping `getShipment` enforces). 404 if no label.
+   * Pass `download` to force a save dialog instead of inline render.
+   */
+  async getLabelUrl(
+    userId: string,
+    shipmentId: string,
+    download = false,
+  ): Promise<{ url: string; expiresIn: number; contentType: string | null }> {
+    await this.getShipment(userId, shipmentId);
+
+    const label = await this.labelRepo.findOne({ where: { shipmentId } });
+    if (!label) throw new NotFoundException('This shipment has no label attached');
+
+    const filename = label.objectKey.split('/').pop() ?? 'label';
+    const url = await this.storage.getSignedUrl(
+      label.objectKey,
+      LABEL_URL_TTL_SECONDS,
+      download ? filename : undefined,
+    );
+    return { url, expiresIn: LABEL_URL_TTL_SECONDS, contentType: label.contentType };
+  }
+
+  /**
+   * Remove a shipment's label (deletes the `shipment_labels` row and the stored
+   * object). Same gating as {@link setLabel}: the owning client, while non-terminal.
+   */
+  async deleteLabel(userId: string, shipmentId: string) {
+    const shipment = await this.getShipment(userId, shipmentId);
+    this.assertLabelEditable(shipment, userId);
+
+    const label = await this.labelRepo.findOne({ where: { shipmentId: shipment.id } });
+    if (!label) throw new NotFoundException('This shipment has no label attached');
+
+    await this.labelRepo.delete({ id: label.id });
+    await this.storage.delete(label.objectKey);
+    return { shipmentId: shipment.id, hasLabel: false };
+  }
+
+  /** Only the owning client may manage the label, and only before a terminal state. */
+  private assertLabelEditable(shipment: Shipment, userId: string): void {
+    if (shipment.userId !== userId) {
+      throw new ForbiddenException('Only the client who placed the shipment can manage its label');
+    }
+    if (SHIPMENT_TERMINAL_STATUSES.includes(shipment.status)) {
+      throw new BadRequestException(`Cannot change the label of a ${shipment.status} shipment`);
+    }
+  }
+
+  /**
+   * Delete labels belonging to DONE/CANCELLED shipments to reclaim storage: removes the
+   * `shipment_labels` row and its bucket object (the shipment itself is untouched). A
+   * label is only needed until the shipment is fulfilled or cancelled. Idempotent and
+   * safe to run repeatedly — driven by a daily cron (see ShipmentLabelCleanupService).
+   * Returns how many labels were removed.
+   */
+  async expireLabelsForClosedShipments(): Promise<number> {
+    const stale = await this.labelRepo
+      .createQueryBuilder('l')
+      .innerJoin('l.shipment', 's')
+      .where('s.status IN (:...statuses)', { statuses: [...SHIPMENT_TERMINAL_STATUSES] })
+      .getMany();
+
+    for (const label of stale) {
+      await this.labelRepo.delete({ id: label.id });
+      await this.storage.delete(label.objectKey);
+    }
+    return stale.length;
   }
 
   /** A shipment's audit trail, oldest first, keyset-paginated by (created_at, id). */
@@ -646,9 +845,4 @@ export class ShipmentService {
 
     return toPage(await qb.getMany(), limit);
   }
-}
-
-/** Total quantity across a set of shipment lines. */
-function totalQty(items: Array<{ qty: number }>): number {
-  return items.reduce((sum, item) => sum + item.qty, 0);
 }

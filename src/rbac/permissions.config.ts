@@ -134,21 +134,33 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   // Shipments (outbound withdrawals of warehoused goods) — the mirror of orders.
   // Three roles, all read routes reachable by any of them; ShipmentService applies
   // the row-level scoping and the lock-gated split of the shared PATCH routes:
-  //   - `place_shipment`  — a client: requests shipments against their own
-  //                         warehoused orders, and while unlocked edits their lines
-  //                         or cancels them; reads *their own* shipments and history.
+  //   - `place_shipment`  — a client: requests shipments against their own warehoused
+  //                         line items, while unlocked edits their lines or cancels
+  //                         them, and manages the printable shipping label; reads
+  //                         *their own* shipments and history.
   //   - `review_shipment` — a reviewer: reviews and locks shipments (the billing +
   //                         stock-deduction handoff), and reads *every* shipment.
-  //   - `process_shipment` — operations: drives a *locked* shipment to DELIVERED /
+  //   - `process_shipment` — operations: drives a *locked* shipment to DONE /
   //                         CANCELLED, and reads *every locked* shipment and history.
+  //
+  // Inventory (GET /inventory): a read-only view of RECEIVED order line items with
+  // stock left to ship — the basis for placing a shipment. Reachable by any of the
+  // three shipment roles; InventoryService applies the same scoping as the shipment
+  // reads (place_shipment sees only their own lines, review/process see all in the org).
   place_shipment: [
     'post /shipments',
     'patch /shipments/:shipmentId',
     'patch /shipments/:shipmentId/status',
+    // The owning client attaches / replaces / removes the printable shipping label
+    // (the GET presigned-URL route is authenticated-only — anyone who can see the
+    // shipment may print it — so it is deliberately left out of the map).
+    'put /shipments/:shipmentId/label',
+    'delete /shipments/:shipmentId/label',
     'get /shipments',
     'get /shipments/:shipmentId',
     'get /shipments/:shipmentId/history',
     'get /shipments/:shipmentId/fees',
+    'get /inventory',
   ],
   review_shipment: [
     'post /shipments/:shipmentId/lock',
@@ -158,6 +170,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'post /shipments/:shipmentId/fees',
     'get /shipments/:shipmentId/fees',
     'delete /shipments/:shipmentId/fees/:feeId',
+    'get /inventory',
   ],
   process_shipment: [
     'patch /shipments/:shipmentId/status',
@@ -167,6 +180,7 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
     'post /shipments/:shipmentId/fees',
     'get /shipments/:shipmentId/fees',
     'delete /shipments/:shipmentId/fees/:feeId',
+    'get /inventory',
   ],
 };
 

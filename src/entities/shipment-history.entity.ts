@@ -6,24 +6,60 @@ import {
   ManyToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
-import { Shipment, ShipmentStatus } from './shipment.entity';
+import { Shipment } from './shipment.entity';
 import { User } from './user.entity';
-import { numericTransformer } from './numeric.transformer';
+import { FieldDiff } from './order-history.entity';
 
+/**
+ * The kind of change a `shipment_history` row records — the mirror of
+ * {@link OrderChangeType}. Shipment-level and line-level changes are distinguished so
+ * the FE can render a headline without parsing the `changes` payload.
+ */
 export enum ShipmentChangeType {
+  /** Shipment placed — `changes` snapshots every line. */
   CREATED = 'CREATED',
-  STATUS_CHANGE = 'STATUS_CHANGE',
-  /** The client edited the shipment's line items while still unlocked. */
-  ITEM_CHANGE = 'ITEM_CHANGE',
-  /** A reviewer (`review_shipment`) locked the shipment, handing it to operations. */
+  /** Header status moved. */
+  STATUS_CHANGED = 'STATUS_CHANGED',
+  /** A reviewer locked the shipment, handing it to operations. */
   LOCKED = 'LOCKED',
+  /**
+   * The client edited the line set while the shipment was still unlocked. A single
+   * summary row per edit; `changes.items` carries every line that changed (added,
+   * qty-updated, or removed).
+   */
+  ITEMS_CHANGED = 'ITEMS_CHANGED',
 }
 
 /**
- * Append-only audit trail for a shipment — the mirror of `order_history`. One row
- * per change; a CREATED row is written on placement. `prev_qty`/`new_qty` hold the
- * shipment's **total** quantity (summed across all its order lines) at the time,
- * since the per-line breakdown lives on `shipment_details`.
+ * The change to one shipment line — the order line item (`order_details`) it draws
+ * from, snapshotted so a removed line still renders, plus a per-field `qty` diff
+ * (to-only when added, from-only when removed, from+to when the qty changed).
+ */
+export interface ShipmentItemChange {
+  /** The order line item this shipment line draws from (`order_details.id`). */
+  orderDetailId: string;
+  /** The referenced order line's name at the time — a snapshot. */
+  name: string;
+  /** The referenced line's order number at the time — a snapshot, for display. */
+  orderNumber?: string;
+  /** Per-field before/after (today just `qty`). */
+  fields?: Record<string, FieldDiff>;
+}
+
+/**
+ * The structured `changes` payload — the mirror of {@link OrderChange}. `shipment`
+ * holds header-field diffs (`status`, `locked`); `items` snapshots every line at
+ * placement (CREATED) or every line that changed in an edit (ITEMS_CHANGED).
+ */
+export interface ShipmentChange {
+  shipment?: Record<string, FieldDiff>;
+  items?: ShipmentItemChange[];
+}
+
+/**
+ * Append-only audit trail for a shipment — the mirror of `order_history`. One row per
+ * user action; the `change_type` categorizes it and the `changes` JSON carries the
+ * before/after detail the FE shows.
  */
 @Entity({ schema: 'wh', name: 'shipment_history' })
 export class ShipmentHistory {
@@ -45,17 +81,9 @@ export class ShipmentHistory {
   @Column({ type: 'varchar', length: 50, name: 'change_type' })
   changeType: ShipmentChangeType;
 
-  @Column({ type: 'varchar', length: 50, name: 'prev_status', nullable: true })
-  prevStatus: ShipmentStatus | null;
-
-  @Column({ type: 'varchar', length: 50, name: 'new_status', nullable: true })
-  newStatus: ShipmentStatus | null;
-
-  @Column({ type: 'numeric', name: 'prev_qty', nullable: true, transformer: numericTransformer })
-  prevQty: number | null;
-
-  @Column({ type: 'numeric', name: 'new_qty', nullable: true, transformer: numericTransformer })
-  newQty: number | null;
+  /** Structured before/after for this change; see {@link ShipmentChange}. */
+  @Column({ type: 'jsonb', nullable: true })
+  changes: ShipmentChange | null;
 
   @Column({ type: 'text', nullable: true })
   note: string | null;

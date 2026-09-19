@@ -1,8 +1,7 @@
 import { IsIn, IsOptional, IsString, MaxLength } from 'class-validator';
 import { OrderStatus } from '../../entities/order.entity';
 
-/** The order-header states a caller may move an order to (COMPLETED is excluded — it
- * is shipment-only legacy, never a client/operations move). */
+/** The order-header states a caller may move an order to. */
 const MANAGED_STATUSES = [
   OrderStatus.IN_TRANSIT,
   OrderStatus.IN_WAREHOUSE,

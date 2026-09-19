@@ -38,20 +38,17 @@ const CLIENT_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   [OrderStatus.IN_TRANSIT]: [OrderStatus.CANCELLED],
   [OrderStatus.IN_WAREHOUSE]: [],
   [OrderStatus.CANCELLED]: [],
-  [OrderStatus.COMPLETED]: [],
 };
 
 /**
  * Status moves **operations** (process_order) may make, once the order is locked:
  * confirm the goods into the warehouse (at which point the lines become inventory),
- * or cancel. CANCELLED is reachable from any live state. COMPLETED is shipment-only
- * legacy and is never a move here.
+ * or cancel. CANCELLED is reachable from any live state.
  */
 const PROCESS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   [OrderStatus.IN_TRANSIT]: [OrderStatus.IN_WAREHOUSE, OrderStatus.CANCELLED],
   [OrderStatus.IN_WAREHOUSE]: [OrderStatus.CANCELLED],
   [OrderStatus.CANCELLED]: [],
-  [OrderStatus.COMPLETED]: [],
 };
 
 /**
@@ -74,7 +71,7 @@ const DETAIL_TRANSITIONS: Record<OrderDetailStatus, OrderDetailStatus[]> = {
 const PENDING_STATUSES: readonly OrderStatus[] = [OrderStatus.IN_TRANSIT];
 
 /** Terminal states — no further transitions, no edits. */
-const TERMINAL_STATUSES: readonly OrderStatus[] = [OrderStatus.CANCELLED, OrderStatus.COMPLETED];
+const TERMINAL_STATUSES: readonly OrderStatus[] = [OrderStatus.CANCELLED];
 
 const ORDER_STATUS_VALUES = new Set<string>(Object.values(OrderStatus));
 
@@ -736,6 +733,37 @@ export class OrderService {
         dto.note ?? null,
       );
 
+      // Moving an order into the warehouse marks every still-pending line as
+      // RECEIVED by default — the common case is that all declared goods arrived.
+      // Operations can still correct individual lines to NOT_ARRIVED or CANCELLED
+      // afterwards via PATCH /orders/:orderId/details/:detailId/status. Lines
+      // already resolved (received/not-arrived/cancelled while locked) are left
+      // untouched. Each auto-receipt is recorded as its own ITEM_RECEIPT row.
+      if (dto.status === OrderStatus.IN_WAREHOUSE) {
+        const pending = await em.find(OrderDetail, {
+          where: { orderId: order.id, status: OrderDetailStatus.PENDING },
+        });
+        for (const detail of pending) {
+          const prev = detail.status;
+          detail.status = OrderDetailStatus.RECEIVED;
+          await em.save(detail);
+
+          const itemChanges: OrderChange = {
+            item: this.itemChange(detail, {
+              status: { from: prev, to: OrderDetailStatus.RECEIVED },
+            }),
+          };
+          await this.writeHistory(
+            em,
+            order.id,
+            userId,
+            OrderChangeType.ITEM_RECEIPT,
+            itemChanges,
+            null,
+          );
+        }
+      }
+
       return saved;
     });
   }
@@ -752,8 +780,6 @@ export class OrderService {
     const limit = parseLimit(limitRaw);
     const qb = this.historyRepo
       .createQueryBuilder('h')
-      // Join the changing user so the FE can render who made each change. Select
-      // only safe columns — never password_hash.
       .leftJoin('h.changedByUser', 'u')
       .addSelect(['u.id', 'u.displayName', 'u.email', 'u.code'])
       .where('h.orderId = :orderId', { orderId })

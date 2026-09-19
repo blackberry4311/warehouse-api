@@ -5,7 +5,7 @@ export class UpdateShipmentStatusDto {
   @IsEnum(ShipmentStatus)
   status: ShipmentStatus;
 
-  /** Optional note recorded on the STATUS_CHANGE history entry. */
+  /** Optional note recorded on the STATUS_CHANGED history entry. */
   @IsOptional()
   @IsString()
   @MaxLength(1000)

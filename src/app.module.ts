@@ -21,6 +21,7 @@ import { CreditResource } from './entities/credit-resource.entity';
 import { Shipment } from './entities/shipment.entity';
 import { ShipmentDetail } from './entities/shipment-detail.entity';
 import { ShipmentHistory } from './entities/shipment-history.entity';
+import { ShipmentLabel } from './entities/shipment-label.entity';
 import { ShipmentSequence } from './entities/shipment-sequence.entity';
 import { TotalFee } from './entities/total-fee.entity';
 import { AuthModule } from './auth/auth.module';
@@ -28,6 +29,7 @@ import { OrganizationModule } from './organization/organization.module';
 import { RbacModule } from './rbac/rbac.module';
 import { OrderModule } from './order/order.module';
 import { ShipmentModule } from './shipment/shipment.module';
+import { InventoryModule } from './inventory/inventory.module';
 import { ExtraFeeModule } from './extra-fee/extra-fee.module';
 import { UserModule } from './user/user.module';
 import { StorageModule } from './storage/storage.module';
@@ -63,6 +65,7 @@ import { ScheduleModule } from '@nestjs/schedule';
           Shipment,
           ShipmentDetail,
           ShipmentHistory,
+          ShipmentLabel,
           ShipmentSequence,
           TotalFee,
         ],
@@ -75,6 +78,7 @@ import { ScheduleModule } from '@nestjs/schedule';
     RbacModule,
     OrderModule,
     ShipmentModule,
+    InventoryModule,
     ExtraFeeModule,
     UserModule,
   ],

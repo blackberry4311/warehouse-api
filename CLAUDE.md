@@ -9,8 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 groups/roles, and permissions), an **order system** (org-scoped orders built from one or more
 **line items** — each with its own quantity and receipt status — with a header status lifecycle
 and an audit trail), a **shipment system** (org-scoped outbound shipments that draw quantity from
-one or more warehoused orders, mirroring the order flow — status lifecycle, review-lock gate, and
-audit trail; **being migrated** to draw from order line items in phase 2, see below), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
+one or more warehoused **order line items**, mirroring the order flow — status lifecycle,
+review-lock gate, and audit trail), an **inventory view** (read-only: the RECEIVED order line
+items with stock left to ship, the basis for placing a shipment), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
 order or a shipment is locked — plus ad-hoc, named **extra fees** staff add against an individual
 order or shipment — with a full ledger), and a small **self-service layer** (the authenticated user
 reads/updates their own profile and reviews their own wallet), all over a Postgres database in the
@@ -92,11 +93,11 @@ class-validator decorators and unknown properties are rejected.
 
 ### Module layout
 - `AppModule` wires global `ConfigModule`, `ScheduleModule.forRoot()` (for cron jobs, e.g. bill
-  expiry), the global `StorageModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
+  expiry and shipment-label cleanup), the global `StorageModule`, a single async `TypeOrmModule.forRootAsync` (Postgres,
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
-  `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, `ExtraFeeModule`, and
-  `UserModule`.
+  `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, `InventoryModule`,
+  `ExtraFeeModule`, and `UserModule`.
 - `AuthModule` — registration/login/refresh/logout. Uses `@nestjs/jwt`, `bcrypt` for password
   hashing, and two Passport JWT strategies:
   - `jwt-access` (Bearer header) — guards ordinary endpoints via `JwtAccessGuard`.
@@ -126,12 +127,23 @@ class-validator decorators and unknown properties are rejected.
   transaction. Both `OrderService` and `OrganizationService` (for the credit ledger) share the keyset
   pagination helper in `src/common/pagination.util.ts`.
 - `ShipmentModule` (`src/shipment/`) — the shipment system: request shipments (each drawing quantity
-  from one or more warehoused orders), review/lock them, drive their status, and read shipments +
-  history. Structurally the mirror of `OrderModule` — standalone, imports `OrganizationModule` only to
-  reuse `OrganizationService`. All logic lives in `ShipmentService`, including the `SHIPMENT_LOCK`
-  credit charge **and** the stock deduction on lock (it adds each line's qty to the order's
-  `shipped_qty` and writes `order_history` for any order it completes, all in the lock transaction).
+  from one or more warehoused **order line items**), review/lock them, drive their status, and read
+  shipments + history. Structurally the mirror of `OrderModule` — standalone, imports
+  `OrganizationModule` only to reuse `OrganizationService`. All logic lives in `ShipmentService`,
+  including the `SHIPMENT_LOCK` credit charge **and** the stock deduction on lock (it adds each line's
+  qty to the order line item's `order_details.shipped_qty`, each detail row locked `FOR UPDATE`, all in
+  the lock transaction; the order header is never touched). It also owns the **shipment label** image
+  (client-uploaded, warehouse-printed) via the global `StorageService`, and registers
+  `ShipmentLabelCleanupService` — a daily `@Cron` that deletes labels of `DONE`/`CANCELLED` shipments.
   Shares the keyset pagination helper.
+- `InventoryModule` (`src/inventory/`) — a read-only view over warehoused inventory: `GET /inventory`
+  lists the RECEIVED order line items (`order_details`) that still have stock left to ship
+  (`qty - shipped_qty > 0`), the basis for placing a shipment. Standalone module (its own
+  `InventoryService` over `forFeature([OrderDetail])`), imports `OrganizationModule` for
+  `OrganizationService` (org existence, membership, permission checks). Gated in `PERMISSION_API_MAP`
+  by the three shipment permissions; `InventoryService` applies shipment-style row scoping
+  (`place_shipment` sees only their own lines, `review_shipment`/`process_shipment` and admins see all
+  in the org). Shares the keyset pagination helper.
 - `ExtraFeeModule` (`src/extra-fee/`) — the **fee** layer on an individual order or shipment, over the
   unified `total_fees` table (`TotalFee` entity): the protected **lock fee** plus ad-hoc **extra fees**.
   Standalone module (its own `ExtraFeeService`, two controllers `OrderFeeController` /
@@ -156,12 +168,14 @@ class-validator decorators and unknown properties are rejected.
   Garage / AWS S3. Methods: `put(key, body, contentType)`,
   `delete(key)`, `buildKey(prefix, filename, label?)` — a flat, unique key
   `[<S3_PREFIX>/]<prefix>/[<label>-]<uuid><ext>` (the optional `label`, e.g. an owning row id, is
-  prepended for traceability; no extra path level; bill keys are `credit-bills/<entryId>-<uuid><ext>`),
+  prepended for traceability; no extra path level; bill keys are `credit-bills/<entryId>-<uuid><ext>`,
+  shipment-label keys `shipment-labels/<shipmentId>-<uuid><ext>`),
   and `getSignedUrl(key, expiresIn?, downloadFilename?)` — a short-lived **presigned GET URL** the
   browser opens directly (no bytes through the API), signed against `S3_PUBLIC_ENDPOINT` when set.
   It knows nothing about credit/bills — callers own the key scheme and any DB bookkeeping — so other
-  features (e.g. future shipment images) reuse it. First consumer: **top-up bills** (see **Credit /
-  billing** → **Top-up bills**). Boot never fails when storage is unconfigured; only calls that touch
+  features reuse it. Two consumers: **top-up bills** (see **Credit / billing** → **Top-up bills**) and
+  **shipment labels** (see **Shipment system** → **Shipment labels**). Boot never fails when storage is
+  unconfigured; only calls that touch
   the bucket do. File uploads arrive as `multipart/form-data` via `@fastify/multipart` (registered in
   `main.ts`, 1 file, 10 MB cap) and are read with the reusable `readSingleUploadedFile` helper
   (`src/common/uploaded-file.util.ts`, enforces content-type + size).
@@ -306,17 +320,20 @@ post-lock), so the client can never touch a locked order and operations can neve
 one. Locking is thus the handoff: a reviewer locks an `IN_TRANSIT` order, after which the warehouse
 lifecycle begins.
 
-> **`OrderStatus.COMPLETED` is deprecated (phase-2 removal).** It is no longer part of the order
-> lifecycle — `updateStatus` never moves to it — and is retained in the enum and the DB `CHECK` only
-> because the not-yet-refactored shipment module still sets it. See the phase-2 note under **Shipment
-> system**.
+**Moving to `IN_WAREHOUSE` auto-receives the lines.** When operations moves a locked order to
+`IN_WAREHOUSE` (`updateStatus`), every still-`PENDING` line is flipped to `RECEIVED` in the same
+transaction (one `ITEM_RECEIPT` history row each); lines already resolved (`RECEIVED`/`NOT_ARRIVED`/
+`CANCELLED`) are left untouched. Operations can still correct any line afterwards via the
+`/details/:detailId/status` route. So warehousing an order is what turns its lines into shippable
+inventory by default.
 
 **Line receipt lifecycle** (`OrderDetailStatus` enum + a DB `CHECK` on `order_details.status`):
-`PENDING → RECEIVED` / `NOT_ARRIVED` / `CANCELLED`. A line is created `PENDING`; once the order is
-locked, operations resolves each line via `PATCH /orders/:orderId/details/:detailId/status`
-(`DETAIL_TRANSITIONS` in `OrderService` allows `RECEIVED ↔ NOT_ARRIVED` corrections; `CANCELLED` is
-terminal for a line). A `RECEIVED` line is a warehouse inventory unit; `NOT_ARRIVED` records a line the
-client declared but that never reached the warehouse.
+`PENDING → RECEIVED` / `NOT_ARRIVED` / `CANCELLED`. A line is created `PENDING` and auto-flipped to
+`RECEIVED` when the order is warehoused (above); operations can also resolve/correct each line via
+`PATCH /orders/:orderId/details/:detailId/status` (`DETAIL_TRANSITIONS` in `OrderService` allows
+`RECEIVED ↔ NOT_ARRIVED` corrections; `CANCELLED` is terminal for a line). A `RECEIVED` line is a
+warehouse inventory unit (a shipment draws from `qty - shipped_qty` of it); `NOT_ARRIVED` records a
+line the client declared but that never reached the warehouse.
 
 **Order numbers** are human-readable and generated per placement as `<user code>-<6-digit seq>`
 (e.g. `ACME-000123`):
@@ -361,76 +378,110 @@ group-permission endpoints — `place_order` to a client group (place/edit + rea
 
 ### Shipment system (`ShipmentController`, prefix `shipments`)
 A **shipment** is a client's request to withdraw goods back out of the warehouse: it draws quantity
-from one or more of the client's own warehoused orders. The module is the **mirror of the order
-system** — same top-level org-scoped resource shape, same three-role + review/lock gate, same
-row-level scoping, same cursor pagination and audit trail — so most of the order-system notes above
-apply verbatim, with these shipment-specific points:
+from one or more of the client's own warehoused **order line items** (`order_details`). The module is
+the **mirror of the order system** — same top-level org-scoped resource shape, same three-role +
+review/lock gate, same row-level scoping, same cursor pagination and audit trail — so most of the
+order-system notes above apply verbatim, with these shipment-specific points:
 
-> **Phase-2 refactor pending — the shipment module is currently stubbed.** The order module moved to
-> line items (`order_details`) in phase 1, and the order header's scalar `qty` column has now been
-> **dropped**. The shipment module used to draw stock from that header (`orders.qty -
-> orders.shipped_qty`), so until it is repointed at `order_details` its qty reads in
-> `shipment.service.ts` are stubbed to `0` — meaning **no stock can be drawn**: creating/locking a
-> shipment against any order is rejected as "0 left to ship". `orders.shipped_qty` and
-> `OrderStatus.COMPLETED` remain as `@deprecated` shipment-only legacy (phase 2 drops them too). The
-> description below is the **intended** shipment behavior, not what the stub currently does.
-
-**Shipment ↔ order is many-to-many.** One shipment can ship (say) 10 units from order A and 20 from
-order B. The per-order quantities live on the `shipment_details` junction (`Shipment.items`), keyed
-`(shipment_id_fk, order_id_fk)` with a `qty` column. A shipment only references orders the placing
-client owns, in the shipment's org, that are `IN_WAREHOUSE` with enough **remaining** qty (this draw is
-what phase 2 will recompute from `order_details`; see the phase-2 note above).
+**Shipment ↔ order line item is many-to-many.** One shipment can ship (say) 10 units from line A and 20
+from line B. The per-line quantities live on the `shipment_details` junction (`Shipment.items`), keyed
+`(shipment_id_fk, order_detail_id_fk)` with a `qty` column. A shipment only references order line items
+the placing client owns, in the shipment's org, that are `RECEIVED` (warehoused inventory) with enough
+**remaining** qty (`order_details.qty - order_details.shipped_qty`). Browse shippable inventory via
+`GET /inventory` (see below); a shipment line references a line item's `detailId` as `orderDetailId`.
 
 **Three roles + the review/lock gate** (identical structure to orders, resolved by
 `ShipmentService.resolveAccess` via `OrganizationService.hasOrgPermission`):
-- `place_shipment` — a **client**: requests shipments against their own orders, and while **unlocked**
-  edits the line set / tracking (`PATCH /shipments/:shipmentId`) or cancels; reads **only their own**
-  shipments and history.
-- `review_shipment` — a **reviewer**: reviews and **locks** a `REQUESTED` shipment
+- `place_shipment` — a **client**: requests shipments against their own warehoused line items, and while
+  **unlocked** edits the line set (`PATCH /shipments/:shipmentId`) or cancels; manages the shipment's
+  printable **label** (`PUT`/`DELETE /shipments/:shipmentId/label`); reads **only their own** shipments
+  and history.
+- `review_shipment` — a **reviewer**: reviews and **locks** an `AWAITING` shipment
   (`POST /shipments/:shipmentId/lock`); reads **every** shipment in the org. Only `review_shipment` can
   lock. (There is no reviewer edit-after-lock, unlike orders — a locked shipment's lines are fixed.)
-- `process_shipment` — **operations**: drives a **locked** shipment to `DELIVERED`/`CANCELLED`
+- `process_shipment` — **operations**: drives a **locked** shipment to `DONE`/`CANCELLED`
   (`PATCH /shipments/:shipmentId/status`), and reads **every *locked*** shipment and its history.
 
 The read routes (`GET /shipments`, `GET /shipments/:shipmentId`, `GET /shipments/:shipmentId/history`)
 are reachable by any of the three; `ShipmentService` applies the same own/all/locked-only scoping and
 `404`-on-out-of-scope as orders. `GET /shipments` takes a required `?orgId=`, optional `?status=`,
-`?search=` (shipment number), `?locked=`, and keyset `limit`/`cursor`. `GET /shipments/:shipmentId`
-returns the shipment with its `items` (each carrying the referenced order's number/qty/status), plus
-`totalFee` — the sum of every non-voided fee on it (lock fee + active extra fees), for the FE's running
-cost (`ShipmentService.getShipmentDetail`).
+`?search=` (shipment number), `?locked=`, and keyset `limit`/`cursor`. Every read carries a `hasLabel`
+boolean (whether a label image is attached) — batched on the list, joined on the detail. `GET
+/shipments/:shipmentId` returns the shipment with its `items` (each carrying the referenced line item's
+name/qty/shipped_qty/status and its order's number), plus `totalFee` — the sum of every non-voided fee
+on it (lock fee + active extra fees), for the FE's running cost (`ShipmentService.getShipmentDetail`).
 
-**Status lifecycle** (`ShipmentStatus` enum + DB `CHECK`): `REQUESTED → DELIVERED`, with `CANCELLED`
-reachable from `REQUESTED`; `DELIVERED`/`CANCELLED` are terminal. Split by the lock gate in
-`ShipmentService` (`CLIENT_SHIPMENT_TRANSITIONS` / `PROCESS_SHIPMENT_TRANSITIONS`): while **unlocked**
-only the owning client may act (cancel a `REQUESTED` shipment); once **locked** only operations may act
-(`DELIVERED` or `CANCELLED`). Locking does **not** change `status` (it stays `REQUESTED`), exactly like
-orders.
+**Status lifecycle** (`ShipmentStatus` enum + DB `CHECK`): `AWAITING → DONE`, with `CANCELLED`
+reachable from `AWAITING`; `DONE`/`CANCELLED` are terminal. `AWAITING` is the single initial state
+(created by the client). Split by the lock gate in `ShipmentService`
+(`CLIENT_SHIPMENT_TRANSITIONS` / `PROCESS_SHIPMENT_TRANSITIONS`): while **unlocked** only the owning
+client may act (cancel an `AWAITING` shipment); once **locked** only operations may act (`DONE` or
+`CANCELLED`). Locking does **not** change `status` (it stays `AWAITING`), exactly like orders.
 
 **Lock is the billing + stock-deduction event** (`ShipmentService.lockShipment`, one transaction):
 - the shipment's **client** (`shipment.userId`) is charged the org's flat `SHIPMENT_LOCK` fee — same
   `FOR UPDATE`/insufficient-credit/`fee 0 = no charge` mechanics as the order-lock charge, writing a
   `SHIPMENT_LOCK` `credit_history` row linked via the new `credit_history.shipment_id_fk`;
-- each line's `qty` is added to its order's `shipped_qty` (each order row locked `FOR UPDATE` and
-  re-checked so concurrent locks can't over-ship), and any order whose `shipped_qty` reaches its `qty`
-  is moved to `COMPLETED` with an `order_history` `STATUS_CHANGED` row written by the acting reviewer;
+- each line's `qty` is added to the order line item's `order_details.shipped_qty` (each `order_details`
+  row locked `FOR UPDATE` and re-checked against its `qty` so concurrent locks can't over-ship the same
+  inventory); the order header is **never** touched (no status change, no `order_history` row);
 - a `LOCKED` `shipment_history` row is written.
 
 Cancelling a **locked** shipment (operations) **reverses the deduction**: it subtracts each line's qty
-back from the order's `shipped_qty` and reverts any order it had completed back to `IN_WAREHOUSE` (with
-an `order_history` row). The fee is **not** refunded (mirrors orders). Cancelling an unlocked shipment
-moves nothing (nothing was deducted).
+back from the order line item's `shipped_qty`, returning it to available inventory. The fee is **not**
+refunded (mirrors orders). Cancelling an unlocked shipment moves nothing (nothing was deducted).
 
 **Shipment numbers**: `<user code>-S<6-digit seq>` (e.g. `ACME-S000123`), from a per-`(user, org)`
 `wh.shipment_sequences` counter bumped the same way as `order_sequences`; unique per org. **History**:
-`shipment_history` mirrors `order_history` (`CREATED` on placement, `ITEM_CHANGE` on a client edit,
-`LOCKED` on review, `STATUS_CHANGE` on status moves), with `prev_qty`/`new_qty` holding the shipment's
-**total** qty (summed across lines, since the per-line breakdown is on `shipment_details`), and
-`changedByUser` joined the same way.
+`shipment_history` mirrors `order_history` structurally — a `change_type` headline plus a `changes`
+**`jsonb`** before/after payload (built by `ShipmentService.writeHistory` / `shipmentItemChange`): `changes.shipment`
+holds header-field diffs (`status`, `locked`) and `changes.items` snapshots line items. Change types:
+`CREATED` (placement, all lines snapshot), `STATUS_CHANGED` (header status), `LOCKED` (review), and
+`ITEMS_CHANGED` — a client edit (`PATCH /shipments/:shipmentId`) replaces the line set and writes **one
+summary row per edit**, with `changes.items` carrying every line that changed (added → qty to-only,
+qty-updated → from+to, removed → from-only). A shipment line item snapshots the order line item it draws
+from (`orderDetailId`, the referenced line's `name` and `orderNumber`, and the `qty` diff). The old typed
+diff columns (`prev_status`/`new_status`/`prev_qty`/`new_qty`) and the `STATUS_CHANGE`/`ITEM_CHANGE` types
+are **gone**, superseded by `changes`. `changedByUser` is joined on `changed_by_fk` the same way.
+
+**Shipment labels.** A shipment carries a printable **shipping-label image** (e.g. a USPS label) the
+warehouse prints — it replaced the old free-text `tracking` field. The image is stored in a **separate**
+`shipment_labels` table (`ShipmentLabel` entity), mirroring `credit_resources` exactly: the row holds
+the object-storage `object_key` (+ `content_type`, `size`, `created_at`) and a **unique**
+`shipment_id_fk` (→ `shipments`, `on delete cascade`, one label per shipment); the bytes live in the
+bucket via `StorageService`, never in the DB. Managed via `ShipmentService`
+(`setLabel` / `getLabelUrl` / `deleteLabel`) over three routes:
+- `PUT /shipments/:shipmentId/label` (`place_shipment`) — the owning **client** attaches or **replaces**
+  the label (`multipart/form-data`, one file field; jpeg/png/webp/pdf, ≤10 MB via `readSingleUploadedFile`).
+  Allowed only while the shipment is **non-terminal** (not `DONE`/`CANCELLED`); a re-upload writes a fresh
+  object and deletes the old one.
+- `GET /shipments/:shipmentId/label` (authenticated-only; the service authorizes via shipment
+  visibility, so **anyone who can see the shipment** — client, reviewer, operations — can print it)
+  returns a **presigned URL** `{ url, expiresIn, contentType }` the browser/print machine loads straight
+  from the bucket, never proxying bytes (`?download=true` forces a save dialog); valid for
+  `LABEL_URL_TTL_SECONDS` (7 days, `src/common/shipment-label.util.ts`).
+- `DELETE /shipments/:shipmentId/label` (`place_shipment`) — the owning client removes it (row + object).
+
+Unlike bills, labels are **not** age-expired — they're deleted once their shipment is `DONE`/`CANCELLED`
+(a label is useless past then): `ShipmentService.expireLabelsForClosedShipments` (a daily `@Cron` in
+`ShipmentLabelCleanupService`) drops those rows and their bucket objects.
 
 **Adding shipment permissions to a group:** the three permissions (`place_shipment`, `review_shipment`,
 `process_shipment`) are seeded in `scripts/init.sql` and mapped in `PERMISSION_API_MAP`; grant them to
 groups exactly as the order permissions.
+
+### Inventory (`InventoryController`, prefix `inventory`)
+A read-only view of what is available to ship: the `RECEIVED` order line items (`order_details`) that
+still have stock (`qty - shipped_qty > 0`). It is the browse-then-ship entry point — a client lists
+their inventory, then references a line's `detailId` (as `orderDetailId`) in a shipment.
+- `GET /inventory?orgId=:orgId` (`place_shipment` | `review_shipment` | `process_shipment`) — list an
+  org's available inventory, newest line first, keyset-paginated (`limit`/`cursor`, same scheme as the
+  order/shipment lists, keyed on `order_details (created_at, id)`). Optional `?search=` matches the
+  order number or the line name (case-insensitive). Row scoping mirrors shipments: `place_shipment` sees
+  only lines on the orders they placed; `review_shipment`/`process_shipment` and admins see every
+  client's inventory in the org (`InventoryService.listInventory`). Each row is
+  `{ detailId, orderId, orderNumber, clientId, name, qty, shippedQty, remaining, note, status,
+  createdAt }`. No new permission — reuses the shipment role permissions.
 
 ### Fees (`OrderFeeController` / `ShipmentFeeController`, under `orders` / `shipments`)
 Every fee charged against a single order or shipment lives in **one** table (`wh.total_fees`,
@@ -634,7 +685,7 @@ Postgres schema is `wh` (not `public`); table/column names are snake_case. `scri
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
 `OrderDetail`, `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `CreditResource`,
-`Shipment`, `ShipmentDetail`, `ShipmentHistory`, `ShipmentSequence`, `TotalFee`.
+`Shipment`, `ShipmentDetail`, `ShipmentHistory`, `ShipmentLabel`, `ShipmentSequence`, `TotalFee`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -656,19 +707,22 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   (`orders_org_number_unique` on `(org_id_fk, order_number)`), `org_id_fk`, `user_id_fk` (the client
   who placed it), `tracking` (`text`, NOT NULL — the client's
   free-text carrier reference/URL, supplied at placement), `status` (`CHECK`-constrained:
-  `IN_TRANSIT` | `IN_WAREHOUSE` | `CANCELLED`, plus the deprecated `COMPLETED` — see below), and the
+  `IN_TRANSIT` | `IN_WAREHOUSE` | `CANCELLED`), and the
   review gate `locked` (when and by whom it was locked aren't stored on the order — they're the
   `LOCKED` `order_history` row's `created_at` / `changed_by_fk`). Composite index
   `orders_org_locked_created_idx (org_id_fk, locked, created_at desc, id desc)` backs the operations
-  queue (the `locked = true` keyset scan). The header's old scalar `qty` column has been **dropped** —
-  quantity lives on `order_details`. **Deprecated (phase-2 removal):** `shipped_qty`, retained only for
-  the not-yet-refactored (currently stubbed) shipment module; and the `COMPLETED` status value it still
-  references.
+  queue (the `locked = true` keyset scan). The header's old scalar `qty` **and** `shipped_qty` columns
+  have both been **dropped** — quantity lives on `order_details`, and shipped quantity is now per-line
+  too (the order header is never touched by shipments). The deprecated `COMPLETED` status has been
+  removed from the enum and the DB `CHECK`.
 - `OrderDetail` → `order_details` — an order's **line items** (where quantity now lives). `order_id_fk`
   (→ `orders`, `on delete cascade`), `name` (`varchar(255)` — the client's free text slugified and
-  hyphen-joined to their client `code`, e.g. `ACME-this-is-test`), `qty` (numeric), optional `note`,
+  hyphen-joined to their client `code`, e.g. `ACME-this-is-test`), `qty` (numeric), `shipped_qty`
+  (numeric, default 0 — how much of this line has been shipped back out; `qty - shipped_qty` is the
+  line's remaining inventory, bumped/reversed by `ShipmentService` on lock/cancel), optional `note`,
   and `status` (`CHECK`-constrained:
-  `PENDING` | `RECEIVED` | `NOT_ARRIVED` | `CANCELLED` — the per-line receipt lifecycle). Reverse index
+  `PENDING` | `RECEIVED` | `NOT_ARRIVED` | `CANCELLED` — the per-line receipt lifecycle; a `RECEIVED`
+  line with stock left is an inventory unit a shipment draws from). Reverse index
   `order_details_order_idx` on `order_id_fk`.
 - `OrderHistory` → `order_history` — append-only structured change log. `change_type`
   (`CHECK`-constrained: `CREATED` | `ORDER_UPDATED` | `STATUS_CHANGED` | `LOCKED` | `ITEM_ADDED` |
@@ -681,21 +735,32 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   `user_id_fk, org_id_fk`); mutated via raw `ON CONFLICT` SQL, not the repository.
 - `users.code` — per-user client code feeding order numbers **and** each line item's `name` prefix
   (unique; NULLs allowed).
-- `orders.shipped_qty` (`numeric`, default 0) — **deprecated (phase-2 removal)**; shipment-only legacy.
-  See the `Order` note above and the phase-2 note under **Shipment system**.
 
 **Shipment tables** (entity ↔ table; the mirror of the order tables — see **Shipment system** above):
 - `Shipment` → `shipments` — a shipment placed into an org. `shipment_number` unique per org,
-  `org_id_fk`, `user_id_fk` (the requesting client), `status` (`CHECK`: `REQUESTED` | `DELIVERED` |
-  `CANCELLED`), the review gate `locked`, and nullable `tracking`. Composite indexes
-  `shipments_org_created_idx` and `shipments_org_locked_created_idx` mirror the order queues.
-- `ShipmentDetail` → `shipment_details` — the shipment ↔ order many-to-many line, composite PK
-  `(shipment_id_fk, order_id_fk)` with a per-line `qty` (numeric). Reverse index on `order_id_fk`.
-- `ShipmentHistory` → `shipment_history` — append-only audit log mirroring `order_history`
-  (`change_type` is `CREATED` | `STATUS_CHANGE` | `ITEM_CHANGE` | `LOCKED`; `prev_qty`/`new_qty` hold
-  the shipment's total qty; `changedByUser` joined on `changed_by_fk`).
+  `org_id_fk`, `user_id_fk` (the requesting client), `status` (`CHECK`: `AWAITING` | `DONE` |
+  `CANCELLED`), and the review gate `locked`. Composite indexes
+  `shipments_org_created_idx` and `shipments_org_locked_created_idx` mirror the order queues. (The old
+  free-text `tracking` column has been **dropped** — replaced by the `shipment_labels` image; see below.)
+- `ShipmentDetail` → `shipment_details` — the shipment ↔ **order line item** many-to-many line,
+  composite PK `(shipment_id_fk, order_detail_id_fk)` with a per-line `qty` (numeric). `order_detail_id_fk`
+  → `order_details` (`on delete cascade`). Reverse index `shipment_details_order_detail_id_idx` on
+  `order_detail_id_fk`. (Phase 2 repointed this off the order header's `order_id_fk`.)
+- `ShipmentHistory` → `shipment_history` — append-only structured change log mirroring `order_history`.
+  `change_type` (`CHECK`-constrained: `CREATED` | `STATUS_CHANGED` | `LOCKED` | `ITEMS_CHANGED`), a
+  `changes` **`jsonb`** before/after payload (`ShipmentChange` in
+  `shipment-history.entity.ts`; reuses order's `FieldDiff`), and a free-text `note`. The old typed diff
+  columns (`prev_status`/`new_status`/`prev_qty`/`new_qty`) were dropped. `changedByUser` joined on
+  `changed_by_fk`.
 - `ShipmentSequence` → `shipment_sequences` — per-`(user, org)` shipment-number counter, same shape and
   raw `ON CONFLICT` handling as `order_sequences`.
+- `ShipmentLabel` → `shipment_labels` — the printable shipping-label image for a shipment (replaces the
+  old `tracking` field). Mirrors `credit_resources`: `object_key` (the S3 key), `content_type`, `size`
+  (`bigint`, `numericTransformer`), `created_at` (`timestamp(3)`), and a **unique** `shipment_id_fk`
+  (→ `shipments`, `on delete cascade`) enforcing one label per shipment. Bytes live in object storage,
+  never here. A `label` `@OneToOne(ShipmentLabel)` relation (inverse side, no column) is layered on
+  `Shipment` for the `hasLabel` flag. Deleted by a daily cron once the shipment is `DONE`/`CANCELLED`
+  (see **Shipment system** → **Shipment labels**).
 
 **Credit / billing tables** (entity ↔ table; see **Credit / billing** above):
 - `users.credit` — per-user credit wallet (`numeric`, default 0), the balance charged on order/shipment
@@ -726,10 +791,11 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   `createdByUser` / `voidedByUser` `@ManyToOne(User)` relations (safe columns only). Composite indexes
   `total_fees_order_created_idx` / `total_fees_shipment_created_idx` back the per-target keyset lists.
 
-Note: Postgres `numeric` columns come back as strings from TypeORM — the `Order`/`OrderHistory` qty
-columns (including the deprecated `orders.shipped_qty`), `order_details.qty`, the
-`shipment_details`/`ShipmentHistory` qty columns, `users.credit`, `org_fees.amount`,
-`total_fees.amount`, the `credit_history` amount/balance columns, and `credit_resources.size` all use
+Note: Postgres `numeric` columns come back as strings from TypeORM —
+`order_details.qty` and `order_details.shipped_qty`, the
+`shipment_details.qty` column, `users.credit`, `org_fees.amount`,
+`total_fees.amount`, the `credit_history` amount/balance columns, `credit_resources.size` and
+`shipment_labels.size` all use
 `numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.
 
 Composite-key join entities map the raw uuid columns with `@PrimaryColumn` and layer the `@ManyToOne`

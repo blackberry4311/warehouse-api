@@ -16,7 +16,7 @@ import { CreateExtraFeeDto } from './dto/create-extra-fee.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
 
 /** Order states in which no further fee may be added (matches OrderService). */
-const ORDER_TERMINAL: readonly OrderStatus[] = [OrderStatus.COMPLETED, OrderStatus.CANCELLED];
+const ORDER_TERMINAL: readonly OrderStatus[] = [OrderStatus.CANCELLED];
 
 /**
  * A normalized view of the order/shipment a fee hangs off, so one set of
@@ -107,8 +107,8 @@ export class ExtraFeeService {
       orgId: shipment.orgId,
       clientUserId: shipment.userId,
       locked: shipment.locked,
-      // REQUESTED is the only non-terminal shipment state; it stays REQUESTED while locked.
-      chargeable: shipment.locked && shipment.status === ShipmentStatus.REQUESTED,
+      // AWAITING is the only non-terminal shipment state; it stays AWAITING while locked.
+      chargeable: shipment.locked && shipment.status === ShipmentStatus.AWAITING,
       column: 'shipmentId',
       perms: { review: 'review_shipment', process: 'process_shipment', place: 'place_shipment' },
     };

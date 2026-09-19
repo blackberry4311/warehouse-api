@@ -33,7 +33,8 @@ export enum OrderDetailStatus {
  * the line, not the order, holds the quantity (the order's old scalar `qty` is gone
  * from the API). `name` is the client's per-line free text, slugified and joined to
  * their client code with a hyphen (e.g. code `ACME` + `"blue widgets"` →
- * `ACME-blue-widgets`). A RECEIVED line is a warehouse inventory unit.
+ * `ACME-blue-widgets`). A RECEIVED line is a warehouse inventory unit — the unit a
+ * shipment draws from: `qty - shipped_qty` is what is still available to ship.
  */
 @Entity({ schema: 'wh', name: 'order_details' })
 export class OrderDetail {
@@ -49,6 +50,15 @@ export class OrderDetail {
 
   @Column({ type: 'numeric', transformer: numericTransformer })
   qty: number;
+
+  /**
+   * How much of this line has already been shipped back out via locked shipments.
+   * Bumped in `ShipmentService.lockShipment` (and reversed when a locked shipment is
+   * cancelled). A line can be drawn from only while `shipped_qty < qty`; the
+   * difference is its remaining inventory. Replaces the old order-header `shipped_qty`.
+   */
+  @Column({ type: 'numeric', name: 'shipped_qty', default: 0, transformer: numericTransformer })
+  shippedQty: number;
 
   @Column({ type: 'text', nullable: true })
   note: string | null;

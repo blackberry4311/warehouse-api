@@ -2,7 +2,6 @@ import { Type } from 'class-transformer';
 import {
   ArrayMinSize,
   IsArray,
-  IsNotEmpty,
   IsOptional,
   IsString,
   IsUUID,
@@ -17,22 +16,15 @@ export class PlaceShipmentDto {
   orgId: string;
 
   /**
-   * The orders and per-order quantities to ship. At least one line; each order may
-   * appear at most once (enforced in the service). Every referenced order must be
-   * one the caller placed, in `orgId`, and IN_WAREHOUSE with enough remaining qty.
+   * The order line items and per-line quantities to ship. At least one line; each
+   * line may appear at most once (enforced in the service). Every referenced line
+   * must be one the caller placed, in `orgId`, and RECEIVED with enough remaining qty.
    */
   @IsArray()
   @ArrayMinSize(1)
   @ValidateNested({ each: true })
   @Type(() => ShipmentItemDto)
   items: ShipmentItemDto[];
-
-  /** Optional outbound tracking reference (typically a carrier URL). */
-  @IsOptional()
-  @IsString()
-  @IsNotEmpty()
-  @MaxLength(2048)
-  tracking?: string;
 
   /** Optional free-text note recorded on the CREATED history entry. */
   @IsOptional()
