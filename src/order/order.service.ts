@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { EntityManager, Repository } from 'typeorm';
+import { EntityManager, In, Repository } from 'typeorm';
 import { Order, OrderStatus } from '../entities/order.entity';
 import { OrderDetail, OrderDetailStatus } from '../entities/order-detail.entity';
 import {
@@ -341,7 +341,38 @@ export class OrderService {
       });
     }
 
-    return toPage(await qb.getMany(), limit);
+    const page = toPage(await qb.getMany(), limit);
+    await this.attachListDetails(page.items);
+    return page;
+  }
+
+  /**
+   * Populate each listed order's `details` (its line items) and derived `totalQty` in a
+   * single batched query over the paginated slice. The FE renders each order's lines in a
+   * grid on the list, so the list carries the same `details` shape as the single-order
+   * read — without a per-row fetch.
+   */
+  private async attachListDetails(orders: Order[]): Promise<void> {
+    if (orders.length === 0) return;
+    const ids = orders.map((o) => o.id);
+
+    const details = await this.detailRepo.find({
+      where: { orderId: In(ids) },
+      order: { createdAt: 'ASC' },
+    });
+
+    const byOrder = new Map<string, OrderDetail[]>();
+    for (const d of details) {
+      const list = byOrder.get(d.orderId) ?? [];
+      list.push(d);
+      byOrder.set(d.orderId, list);
+    }
+
+    for (const o of orders) {
+      const lines = byOrder.get(o.id) ?? [];
+      o.details = lines;
+      o.totalQty = lines.reduce((sum, d) => sum + Number(d.qty), 0);
+    }
   }
 
   /**

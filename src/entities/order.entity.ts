@@ -78,6 +78,12 @@ export class Order {
   @OneToMany(() => OrderDetail, (detail) => detail.order)
   details: OrderDetail[];
 
+  /**
+   * Non-persisted summed quantity across `details`. Populated by `listOrders`
+   * (alongside the full `details`) and by the single-order read; `undefined` otherwise.
+   */
+  totalQty?: number;
+
   @CreateDateColumn({ type: 'timestamptz', name: 'created_at', precision: 3 })
   createdAt: Date;
 
