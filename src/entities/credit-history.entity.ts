@@ -16,9 +16,11 @@ import { CreditResource } from './credit-resource.entity';
 import { numericTransformer } from './numeric.transformer';
 
 /**
- * Why a user's credit changed. The charge types (`ORDER_LOCK`, `SHIPMENT_LOCK`)
- * mirror `FeeType` and are what warehouse earnings sum over; `TOP_UP` and
- * `ADJUSTMENT` cover the client adding funds and manual corrections.
+ * Why a user's credit changed. The charge types (`ORDER_LOCK`, `SHIPMENT_LOCK`,
+ * `EXTRA_FEE`) mirror `FeeType` and are what warehouse earnings sum over, together
+ * with `RESELLER_COMMISSION` (a credit-group owner's markup, which nets a marked-up
+ * charge back down to the org base); `TOP_UP` and `ADJUSTMENT` cover the client
+ * adding funds and manual corrections.
  */
 export enum CreditEntryType {
   /** Charged when a reviewer locks the client's order. */
@@ -36,6 +38,14 @@ export enum CreditEntryType {
   TOP_UP = 'TOP_UP',
   /** Manual correction. */
   ADJUSTMENT = 'ADJUSTMENT',
+  /**
+   * The markup a credit group's **owner** earns when a member's order/shipment is
+   * locked: a positive credit (`group fee − org fee`) into the owner's wallet,
+   * linked to the triggering order/shipment and lock fee. Because it is positive
+   * and counted in the warehouse-earnings sum, it self-nets the client's charge
+   * back down to the org base — see the earnings note below.
+   */
+  RESELLER_COMMISSION = 'RESELLER_COMMISSION',
 }
 
 /**
@@ -43,7 +53,10 @@ export enum CreditEntryType {
  * delta (negative = charge, positive = top-up/refund) so `newBalance = prevBalance
  * + amount` always holds; `order` links a charge to the order that triggered it.
  * Warehouse earnings for an org over a period = `-SUM(amount)` over the charge
- * entry types.
+ * entry types, which **include** `RESELLER_COMMISSION`: since a commission is a
+ * positive credit to a credit-group owner, subtracting it nets the client's marked-up
+ * charge back down to the org base the warehouse actually keeps. A reviewer's own
+ * earnings = `SUM(amount)` over their `RESELLER_COMMISSION` rows.
  */
 @Entity({ schema: 'wh', name: 'credit_history' })
 export class CreditHistory {

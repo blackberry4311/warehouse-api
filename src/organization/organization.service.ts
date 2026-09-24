@@ -18,6 +18,9 @@ import { User } from '../entities/user.entity';
 import { OrgFee } from '../entities/org-fee.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
 import { CreditResource } from '../entities/credit-resource.entity';
+import { CreditGroup } from '../entities/credit-group.entity';
+import { CreditGroupFee } from '../entities/credit-group-fee.entity';
+import { CreditGroupMember } from '../entities/credit-group-member.entity';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { CreateGroupDto } from './dto/create-group.dto';
@@ -26,6 +29,10 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
+import { CreateCreditGroupDto } from './dto/create-credit-group.dto';
+import { UpdateCreditGroupDto } from './dto/update-credit-group.dto';
+import { SetCreditGroupFeeDto } from './dto/set-credit-group-fee.dto';
+import { AddCreditGroupMemberDto } from './dto/add-credit-group-member.dto';
 import { decodeCursor, parseLimit, toPage } from '../common/pagination.util';
 import { attachBillFlag, BILL_URL_TTL_SECONDS } from '../common/credit-bill.util';
 import { StorageService } from '../storage/storage.service';
@@ -49,6 +56,10 @@ export class OrganizationService {
     @InjectRepository(OrgFee) private orgFeeRepo: Repository<OrgFee>,
     @InjectRepository(CreditHistory) private creditHistoryRepo: Repository<CreditHistory>,
     @InjectRepository(CreditResource) private creditResourceRepo: Repository<CreditResource>,
+    @InjectRepository(CreditGroup) private creditGroupRepo: Repository<CreditGroup>,
+    @InjectRepository(CreditGroupFee) private creditGroupFeeRepo: Repository<CreditGroupFee>,
+    @InjectRepository(CreditGroupMember)
+    private creditGroupMemberRepo: Repository<CreditGroupMember>,
     private readonly storage: StorageService,
   ) {}
 
@@ -447,6 +458,216 @@ export class OrganizationService {
     if (!actor.isAdmin) throw new ForbiddenException('Only a system admin can view fees');
     await this.getOrganization(orgId);
     return this.orgFeeRepo.find({ where: { orgId } });
+  }
+
+  // --- Credit groups (system-admin only) -----------------------------------
+  // A billing-only construct (unrelated to permission `org_groups`): a group of
+  // clients whose lock fee is marked up. The group's owner earns (group fee − org
+  // fee); the warehouse keeps the org fee. All management is system-admin only,
+  // like org fees (routes are not in PERMISSION_API_MAP).
+
+  private async assertSystemAdmin(actingUserId: string): Promise<void> {
+    const actor = await this.ensureUserExists(actingUserId);
+    if (!actor.isAdmin) {
+      throw new ForbiddenException('Only a system admin can manage credit groups');
+    }
+  }
+
+  /** Load a credit group and confirm it belongs to the org (404 otherwise). */
+  private async loadCreditGroup(orgId: string, creditGroupId: string): Promise<CreditGroup> {
+    const group = await this.creditGroupRepo.findOne({ where: { id: creditGroupId, orgId } });
+    if (!group) throw new NotFoundException('Credit group not found in this organization');
+    return group;
+  }
+
+  /**
+   * Create a credit group in an org. The owner (who earns the markup) must be a member
+   * of the org. Group names are unique per org.
+   */
+  async createCreditGroup(actingUserId: string, orgId: string, dto: CreateCreditGroupDto) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.getOrganization(orgId);
+
+    const ownerMembership = await this.userOrgRepo.findOne({
+      where: { orgId, userId: dto.ownerUserId },
+    });
+    if (!ownerMembership) {
+      throw new BadRequestException('The owner must be a member of this organization');
+    }
+
+    const existing = await this.creditGroupRepo.findOne({ where: { orgId, name: dto.name } });
+    if (existing) throw new ConflictException('A credit group with this name already exists');
+
+    const group = this.creditGroupRepo.create({ orgId, name: dto.name, ownerId: dto.ownerUserId });
+    return this.creditGroupRepo.save(group);
+  }
+
+  /**
+   * Change a credit group's owner (the reviewer/reseller who earns the markup). The
+   * new owner must be a member of the org. Past commissions already credited are not
+   * touched; only future locks credit the new owner.
+   */
+  async updateCreditGroup(
+    actingUserId: string,
+    orgId: string,
+    creditGroupId: string,
+    dto: UpdateCreditGroupDto,
+  ) {
+    await this.assertSystemAdmin(actingUserId);
+    const group = await this.loadCreditGroup(orgId, creditGroupId);
+
+    const ownerMembership = await this.userOrgRepo.findOne({
+      where: { orgId, userId: dto.ownerUserId },
+    });
+    if (!ownerMembership) {
+      throw new BadRequestException('The owner must be a member of this organization');
+    }
+
+    group.ownerId = dto.ownerUserId;
+    return this.creditGroupRepo.save(group);
+  }
+
+  /** List an org's credit groups with their fees and owner (safe columns only). */
+  async listCreditGroups(actingUserId: string, orgId: string) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.getOrganization(orgId);
+
+    return this.creditGroupRepo
+      .createQueryBuilder('cg')
+      .leftJoinAndSelect('cg.fees', 'fees')
+      .leftJoin('cg.owner', 'owner')
+      .addSelect(['owner.id', 'owner.displayName', 'owner.email', 'owner.code'])
+      .where('cg.orgId = :orgId', { orgId })
+      .orderBy('cg.createdAt', 'DESC')
+      .getMany();
+  }
+
+  /** One credit group with its fees, owner, and client members (safe columns only). */
+  async getCreditGroup(actingUserId: string, orgId: string, creditGroupId: string) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.getOrganization(orgId);
+
+    const group = await this.creditGroupRepo
+      .createQueryBuilder('cg')
+      .leftJoinAndSelect('cg.fees', 'fees')
+      .leftJoin('cg.owner', 'owner')
+      .addSelect(['owner.id', 'owner.displayName', 'owner.email', 'owner.code'])
+      .leftJoinAndSelect('cg.members', 'members')
+      .leftJoin('members.user', 'mu')
+      .addSelect(['mu.id', 'mu.displayName', 'mu.email', 'mu.code'])
+      .where('cg.id = :creditGroupId', { creditGroupId })
+      .andWhere('cg.orgId = :orgId', { orgId })
+      .getOne();
+
+    if (!group) throw new NotFoundException('Credit group not found in this organization');
+    return group;
+  }
+
+  /** Delete a credit group (its fees and memberships cascade). */
+  async deleteCreditGroup(actingUserId: string, orgId: string, creditGroupId: string) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.loadCreditGroup(orgId, creditGroupId);
+    await this.creditGroupRepo.delete({ id: creditGroupId });
+    return { deleted: true };
+  }
+
+  /**
+   * Upsert a credit group's fee for an action. Rejected if the amount is below the
+   * org's flat fee for the same action, so the owner's markup is never negative.
+   */
+  async setCreditGroupFee(
+    actingUserId: string,
+    orgId: string,
+    creditGroupId: string,
+    dto: SetCreditGroupFeeDto,
+  ) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.loadCreditGroup(orgId, creditGroupId);
+
+    const orgFee = await this.orgFeeRepo.findOne({ where: { orgId, feeType: dto.feeType } });
+    const base = orgFee?.amount ?? 0;
+    if (dto.amount < base) {
+      throw new BadRequestException(
+        `Credit group fee (${dto.amount}) cannot be below the org fee (${base}) for ${dto.feeType}`,
+      );
+    }
+
+    await this.creditGroupFeeRepo.upsert(
+      { creditGroupId, feeType: dto.feeType, amount: dto.amount },
+      ['creditGroupId', 'feeType'],
+    );
+    return this.creditGroupFeeRepo.findOne({ where: { creditGroupId, feeType: dto.feeType } });
+  }
+
+  /** List a credit group's configured fees. */
+  async listCreditGroupFees(actingUserId: string, orgId: string, creditGroupId: string) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.loadCreditGroup(orgId, creditGroupId);
+    return this.creditGroupFeeRepo.find({ where: { creditGroupId } });
+  }
+
+  /**
+   * Add a client to a credit group. The client must be a member of the org and not
+   * already in another credit group in this org (a client belongs to at most one per
+   * org, so their fee is unambiguous).
+   */
+  async addCreditGroupMember(
+    actingUserId: string,
+    orgId: string,
+    creditGroupId: string,
+    dto: AddCreditGroupMemberDto,
+  ) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.loadCreditGroup(orgId, creditGroupId);
+
+    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: dto.userId } });
+    if (!membership) {
+      throw new BadRequestException('The user must be a member of this organization');
+    }
+
+    const existing = await this.creditGroupMemberRepo.findOne({
+      where: { orgId, userId: dto.userId },
+    });
+    if (existing) {
+      if (existing.creditGroupId === creditGroupId) {
+        throw new ConflictException('User is already in this credit group');
+      }
+      throw new ConflictException('User is already in another credit group in this organization');
+    }
+
+    await this.creditGroupMemberRepo.save(
+      this.creditGroupMemberRepo.create({ creditGroupId, userId: dto.userId, orgId }),
+    );
+    return { creditGroupId, userId: dto.userId };
+  }
+
+  /** List a credit group's client members (safe columns only). */
+  async listCreditGroupMembers(actingUserId: string, orgId: string, creditGroupId: string) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.loadCreditGroup(orgId, creditGroupId);
+
+    return this.creditGroupMemberRepo
+      .createQueryBuilder('m')
+      .leftJoin('m.user', 'u')
+      .addSelect(['u.id', 'u.displayName', 'u.email', 'u.code'])
+      .where('m.creditGroupId = :creditGroupId', { creditGroupId })
+      .orderBy('m.createdAt', 'DESC')
+      .getMany();
+  }
+
+  /** Remove a client from a credit group. */
+  async removeCreditGroupMember(
+    actingUserId: string,
+    orgId: string,
+    creditGroupId: string,
+    userId: string,
+  ) {
+    await this.assertSystemAdmin(actingUserId);
+    await this.loadCreditGroup(orgId, creditGroupId);
+
+    const result = await this.creditGroupMemberRepo.delete({ creditGroupId, userId });
+    if (!result.affected) throw new NotFoundException('User is not in this credit group');
+    return { removed: true };
   }
 
   // --- Member credit -------------------------------------------------------

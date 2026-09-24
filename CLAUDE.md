@@ -12,7 +12,8 @@ and an audit trail), a **shipment system** (org-scoped outbound shipments that d
 one or more warehoused **order line items**, mirroring the order flow — status lifecycle,
 review-lock gate, and audit trail), an **inventory view** (read-only: the RECEIVED order line
 items with stock left to ship, the basis for placing a shipment), a **credit / billing layer** (a per-user credit wallet charged a per-org fee when an
-order or a shipment is locked — plus ad-hoc, named **extra fees** staff add against an individual
+order or a shipment is locked — overridable per client by a **credit group** (a reseller markup
+whose owner earns the difference) — plus ad-hoc, named **extra fees** staff add against an individual
 order or shipment — with a full ledger), and a small **self-service layer** (the authenticated user
 reads/updates their own profile and reviews their own wallet), all over a Postgres database in the
 `wh` schema.
@@ -107,8 +108,8 @@ class-validator decorators and unknown properties are rejected.
 - `OrganizationModule` (`src/organization/`) — manages everything under an organization: the org
   itself, membership (users_orgs), groups/roles (org_groups), the global permission catalog
   (permissions), the group↔permission and user↔group wiring, and the **credit / billing layer**
-  (per-org fees, member credit top-ups, the credit-review endpoint, and **top-up bills** — see
-  **Credit / billing**). It exports `OrganizationService` for reuse (by `RbacModule` for permission
+  (per-org fees, **credit groups** (reseller markup), member credit top-ups, the credit-review
+  endpoint, and **top-up bills** — see **Credit / billing**). It exports `OrganizationService` for reuse (by `RbacModule` for permission
   resolution, and by the order / shipment / self-service modules); it does **not** own the global guard.
   It also registers `CreditBillCleanupService` — a daily `@Cron` that expires bills older than two weeks
   via `OrganizationService.expireOldBills` — and injects the global `StorageService` for bill uploads.
@@ -204,6 +205,13 @@ class-validator decorators and unknown properties are rejected.
   bytes through the API (`?download=true` forces a save dialog); the URL is valid for
   `BILL_URL_TTL_SECONDS` (7 days). See **Credit / billing** → **Top-up bills**.
 - Fees (system-admin only): `POST|GET /organizations/:orgId/fees` — set / list an org's flat fees.
+- Credit groups (system-admin only): `POST|GET /organizations/:orgId/credit-groups`,
+  `GET|DELETE /organizations/:orgId/credit-groups/:creditGroupId`,
+  `POST|GET /organizations/:orgId/credit-groups/:creditGroupId/fees` (set/list the group's per-`fee_type`
+  amounts; each rejected below the org fee), and members
+  `POST|GET /organizations/:orgId/credit-groups/:creditGroupId/members` /
+  `DELETE .../members/:userId`. All **not** in `PERMISSION_API_MAP` (`@UseGuards(JwtAccessGuard)` +
+  in-service `is_admin`, like org fees). See **Credit / billing** → **Credit groups**.
 - Groups: `POST|GET /organizations/:orgId/groups`, `DELETE /organizations/:orgId/groups/:groupId`.
 - Group membership: `POST /organizations/:orgId/groups/:groupId/members`,
   `DELETE /organizations/:orgId/groups/:groupId/members/:userId`.
@@ -540,11 +548,14 @@ endpoint); there is no separate module.
   order's **client** (`order.userId`, not the acting reviewer): it `SELECT … FOR UPDATE`s the client's
   row (so concurrent charges/top-ups can't overdraw), throws `400` if `credit < fee`, deducts, and
   writes an `ORDER_LOCK` ledger row linked to the fee row via `fee_id_fk`. A fee of 0 charges nothing
-  and writes no ledger row, but the protected `total_fees` row (amount 0) is still recorded.
+  and writes no ledger row, but the protected `total_fees` row (amount 0) is still recorded. The amount
+  charged is the org fee **unless the client is in a credit group** that overrides it — see **Credit
+  groups** below (the charged amount, and any owner commission, are resolved by
+  `resolveClientFee`/`creditCommission` in `src/common/credit-group.util.ts`).
 - **The charge (shipment lock).** `ShipmentService.lockShipment` charges the shipment's **client** the
   org's `SHIPMENT_LOCK` fee identically — a protected "Shipment lock fee" `total_fees` row plus (when
   the fee > 0) a `SHIPMENT_LOCK` ledger row linked via `credit_history.shipment_id_fk` (rather than
-  `order_id_fk`). See the **Shipment system** above.
+  `order_id_fk`) — again subject to the client's **credit group** override. See the **Shipment system** above.
 - **Top-ups.** `POST /organizations/:orgId/members/:userId/credit` (`TopUpCreditDto`: `amount > 0`,
   optional `note`) adds funds and writes a `TOP_UP` ledger row, in a `FOR UPDATE` transaction. Gated by
   **`manage_org_members`** (whoever manages members manages their top-ups); the acting user must belong
@@ -561,16 +572,38 @@ endpoint); there is no separate module.
   insufficient-credit (`400`)/deduct transaction that writes an `EXTRA_FEE` ledger row linked via
   `credit_history.fee_id_fk`. Both the lock fee and extra fees share the `total_fees` table. See the
   dedicated **Fees** section above.
+- **Credit groups (reseller markup).** A **credit group** is a billing-only construct, deliberately
+  **separate from the permission `org_groups`** — it exists only to mark up the flat lock fee for a set
+  of clients. A group (`wh.credit_groups`, `CreditGroup`) is scoped to an org, has an **owner**
+  (`owner_id_fk` → the reviewer/reseller who earns the markup, and must be an org member), its own
+  per-`fee_type` amounts (`credit_group_fees`, mirroring `org_fees`), and client **members**
+  (`credit_group_members`, unique `(user_id_fk, org_id_fk)` so a client is in **at most one credit group
+  per org** — keeping fee resolution unambiguous). On lock, if the client belongs to a credit group with
+  a fee for that `fee_type`, the **group fee overrides the org fee** as what the client is charged; the
+  split is: the **client** pays the group fee, the **warehouse** keeps the org fee (the base), and the
+  group **owner's wallet is credited** `group fee − org fee` via a positive `RESELLER_COMMISSION` ledger
+  row (linked to the triggering order/shipment and lock fee). A group fee is **floored at the org fee**
+  (enforced when set, and defensively at charge time) so the owner's markup is never negative. Resolution
+  and the owner credit live in `src/common/credit-group.util.ts` (`resolveClientFee` / `creditCommission`),
+  called from both `lockOrder` and `lockShipment`; management is **system-admin only** (see the org
+  endpoints above). A client in no credit group (or a group with no fee for that type) is charged the
+  plain org fee, exactly as before.
 - **The ledger** (`credit_history`). One row per change: `entry_type`
-  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT`), a **signed** `amount`
-  (negative = a charge, positive = top-up/refund/void) so `new_balance = prev_balance + amount` always
-  holds, a nullable `order_id_fk` (set on an `ORDER_LOCK` charge or an order extra fee) **and** a nullable
-  `shipment_id_fk` (set on a `SHIPMENT_LOCK` charge or a shipment extra fee) **and** a nullable
-  `fee_id_fk` (→ `total_fees`, set on a lock-fee or `EXTRA_FEE` charge/void) linking a movement to what
-  triggered it, and the `org_id_fk` the movement happened in.
+  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT` | `RESELLER_COMMISSION`), a
+  **signed** `amount` (negative = a charge, positive = top-up/refund/void/**commission**) so
+  `new_balance = prev_balance + amount` always
+  holds, a nullable `order_id_fk` (set on an `ORDER_LOCK` charge, an order extra fee, or an order-lock
+  commission) **and** a nullable `shipment_id_fk` (set on a `SHIPMENT_LOCK` charge, a shipment extra fee,
+  or a shipment-lock commission) **and** a nullable
+  `fee_id_fk` (→ `total_fees`, set on a lock-fee, `EXTRA_FEE`, or commission row) linking a movement to
+  what triggered it, and the `org_id_fk` the movement happened in.
 - **Warehouse earnings** over a period for an org = `-SUM(amount)` over the charge entry types
-  (`ORDER_LOCK`, `SHIPMENT_LOCK`, `EXTRA_FEE`) in `credit_history` — top-ups (positive) are excluded, and
-  because an extra-fee void is a positive `EXTRA_FEE` reversal it nets its original charge back out.
+  (`ORDER_LOCK`, `SHIPMENT_LOCK`, `EXTRA_FEE`, **`RESELLER_COMMISSION`**) in `credit_history` — top-ups
+  (positive) are excluded, and because both an extra-fee void (a positive `EXTRA_FEE` reversal) and an
+  owner commission (a positive `RESELLER_COMMISSION` credit) are positive, subtracting them nets out:
+  a void cancels its original charge, and a commission brings a marked-up client charge back down to the
+  org base the warehouse actually keeps. A reviewer's own earnings = `SUM(amount)` over their
+  `RESELLER_COMMISSION` rows. (No earnings query is implemented in code yet — this is report-level.)
 - **Top-up bills.** A `TOP_UP` entry can carry one bill/receipt image, stored in a **separate**
   `credit_resources` table (`CreditResource` entity) rather than on `credit_history` — deliberately kept
   off the append-only ledger so it stays lean and the image data can be cleaned up independently. The row
@@ -685,7 +718,8 @@ Postgres schema is `wh` (not `public`); table/column names are snake_case. `scri
 source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `RefreshToken`,
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
 `OrderDetail`, `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `CreditResource`,
-`Shipment`, `ShipmentDetail`, `ShipmentHistory`, `ShipmentLabel`, `ShipmentSequence`, `TotalFee`.
+`Shipment`, `ShipmentDetail`, `ShipmentHistory`, `ShipmentLabel`, `ShipmentSequence`, `TotalFee`,
+`CreditGroup`, `CreditGroupFee`, `CreditGroupMember`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.
@@ -768,7 +802,8 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 - `OrgFee` → `org_fees` — per-org flat fee, composite PK `(org_id_fk, fee_type)`, `amount >= 0`;
   `fee_type` is `CHECK`-constrained (`ORDER_LOCK` | `SHIPMENT_LOCK`). No row = fee 0.
 - `CreditHistory` → `credit_history` — append-only credit ledger. `entry_type` `CHECK`-constrained
-  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT`); **signed** `amount` with
+  (`ORDER_LOCK` | `SHIPMENT_LOCK` | `EXTRA_FEE` | `TOP_UP` | `ADJUSTMENT` | `RESELLER_COMMISSION`);
+  **signed** `amount` with
   `prev_balance`/`new_balance` snapshots; nullable `order_id_fk` (→ `orders`), nullable
   `shipment_id_fk` (→ `shipments`), and nullable `fee_id_fk` (→ `total_fees`), all `on delete set
   null`, linking a movement to what triggered it. Indexed by `(user_id_fk, created_at desc, id desc)` and
@@ -790,10 +825,23 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
   and `voided_at` / `voided_by_fk` (a void, never a delete). `created_by_fk` / `voided_by_fk` expose
   `createdByUser` / `voidedByUser` `@ManyToOne(User)` relations (safe columns only). Composite indexes
   `total_fees_order_created_idx` / `total_fees_shipment_created_idx` back the per-target keyset lists.
+- `CreditGroup` → `credit_groups` — a billing-only client group that marks up the flat lock fee
+  (separate from the permission `org_groups`). `id`, `name`, `org_id_fk` (→ `organizations`),
+  `owner_id_fk` (→ `users`, the reviewer who earns the markup; an `owner` `@ManyToOne(User)` relation,
+  safe columns only), `created_at` (`timestamp(3)`), `updated_at`. Unique `(org_id_fk, name)`; reverse
+  indexes on `org_id_fk` and `owner_id_fk`. `fees` / `members` are `@OneToMany` inverse relations. See
+  **Credit / billing** → **Credit groups**.
+- `CreditGroupFee` → `credit_group_fees` — a credit group's per-action fee, mirroring `org_fees`:
+  composite PK `(credit_group_id_fk, fee_type)`, `amount >= 0`, `fee_type` `CHECK`-constrained
+  (`ORDER_LOCK` | `SHIPMENT_LOCK`). No row = no override for that action (falls back to the org fee).
+- `CreditGroupMember` → `credit_group_members` — client ↔ credit group, composite PK
+  `(credit_group_id_fk, user_id_fk)` with a denormalized `org_id_fk` backing a **unique**
+  `(user_id_fk, org_id_fk)` index (a client is in at most one credit group per org). `created_at`
+  (`timestamp(3)`); reverse index on `credit_group_id_fk`.
 
 Note: Postgres `numeric` columns come back as strings from TypeORM —
 `order_details.qty` and `order_details.shipped_qty`, the
-`shipment_details.qty` column, `users.credit`, `org_fees.amount`,
+`shipment_details.qty` column, `users.credit`, `org_fees.amount`, `credit_group_fees.amount`,
 `total_fees.amount`, the `credit_history` amount/balance columns, `credit_resources.size` and
 `shipment_labels.size` all use
 `numericTransformer` (`src/entities/numeric.transformer.ts`) to expose them as `number`.

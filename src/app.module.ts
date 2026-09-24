@@ -24,6 +24,9 @@ import { ShipmentHistory } from './entities/shipment-history.entity';
 import { ShipmentLabel } from './entities/shipment-label.entity';
 import { ShipmentSequence } from './entities/shipment-sequence.entity';
 import { TotalFee } from './entities/total-fee.entity';
+import { CreditGroup } from './entities/credit-group.entity';
+import { CreditGroupFee } from './entities/credit-group-fee.entity';
+import { CreditGroupMember } from './entities/credit-group-member.entity';
 import { AuthModule } from './auth/auth.module';
 import { OrganizationModule } from './organization/organization.module';
 import { RbacModule } from './rbac/rbac.module';
@@ -68,6 +71,9 @@ import { ScheduleModule } from '@nestjs/schedule';
           ShipmentLabel,
           ShipmentSequence,
           TotalFee,
+          CreditGroup,
+          CreditGroupFee,
+          CreditGroupMember,
         ],
         synchronize: false,
       }),

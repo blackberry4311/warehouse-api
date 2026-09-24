@@ -28,6 +28,7 @@ import { UpdateOrderDetailDto } from './dto/update-order-detail.dto';
 import { UpdateOrderDetailStatusDto } from './dto/update-order-detail-status.dto';
 import { LockOrderDto } from './dto/lock-order.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
+import { creditCommission, resolveClientFee } from '../common/credit-group.util';
 
 /**
  * Status moves the **client** (order owner) may make while the order is still
@@ -643,14 +644,24 @@ export class OrderService {
       const feeRow = await em.findOne(OrgFee, {
         where: { orgId: order.orgId, feeType: FeeType.ORDER_LOCK },
       });
-      const fee = feeRow?.amount ?? 0;
+      // The org's flat fee is the warehouse's base cut. If the client is in a credit
+      // group, its fee overrides this as what the client pays; the group's owner earns
+      // the difference (see resolveClientFee / creditCommission).
+      const base = feeRow?.amount ?? 0;
+      const { charged, ownerId } = await resolveClientFee(
+        em,
+        order.orgId,
+        order.userId,
+        FeeType.ORDER_LOCK,
+        base,
+      );
 
       // Always record the lock fee as a protected (non-voidable) row, so it shows up
       // in the order's fee list alongside any extra fees — even when it is 0.
       const lockFee = await em.save(
         em.create(TotalFee, {
           name: 'Order lock fee',
-          amount: fee,
+          amount: charged,
           isProtected: true,
           orgId: order.orgId,
           orderId: order.id,
@@ -660,7 +671,7 @@ export class OrderService {
         }),
       );
 
-      if (fee > 0) {
+      if (charged > 0) {
         // Lock the client's row so two concurrent locks can't both pass the check
         // and overdraw the balance.
         const rows: Array<{ credit: string }> = await em.query(
@@ -670,10 +681,10 @@ export class OrderService {
         if (rows.length === 0) throw new NotFoundException('Order client not found');
 
         const prevBalance = parseFloat(rows[0].credit);
-        if (prevBalance < fee) {
+        if (prevBalance < charged) {
           throw new BadRequestException('Client has insufficient credit to lock this order');
         }
-        const newBalance = prevBalance - fee;
+        const newBalance = prevBalance - charged;
 
         await em.update(User, { id: order.userId }, { credit: newBalance });
 
@@ -682,7 +693,7 @@ export class OrderService {
             userId: order.userId,
             orgId: order.orgId,
             entryType: CreditEntryType.ORDER_LOCK,
-            amount: -fee,
+            amount: -charged,
             prevBalance,
             newBalance,
             orderId: order.id,
@@ -690,6 +701,20 @@ export class OrderService {
             note: dto.note ?? null,
           }),
         );
+      }
+
+      // Credit the credit group's owner the markup they earned (group fee − org fee);
+      // the warehouse keeps only the org base.
+      const markup = charged - base;
+      if (ownerId && markup > 0) {
+        await creditCommission(em, {
+          ownerId,
+          orgId: order.orgId,
+          amount: markup,
+          orderId: order.id,
+          feeId: lockFee.id,
+          note: dto.note ?? null,
+        });
       }
 
       order.locked = true;

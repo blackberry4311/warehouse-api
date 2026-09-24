@@ -29,6 +29,10 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
+import { CreateCreditGroupDto } from './dto/create-credit-group.dto';
+import { UpdateCreditGroupDto } from './dto/update-credit-group.dto';
+import { SetCreditGroupFeeDto } from './dto/set-credit-group-fee.dto';
+import { AddCreditGroupMemberDto } from './dto/add-credit-group-member.dto';
 
 /** Image/PDF types accepted for a top-up bill (receipt). */
 const BILL_ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
@@ -113,6 +117,114 @@ export class OrganizationController {
     @Param('orgId', ParseUUIDPipe) orgId: string,
   ) {
     return this.orgService.listOrgFees(actor.userId, orgId);
+  }
+
+  // --- Credit groups (system-admin only) -----------------------------------
+  // Billing construct: a set of clients whose lock fee is marked up, with an owner
+  // who earns (group fee − org fee). Not in PERMISSION_API_MAP; the service enforces
+  // is_admin, like org fees.
+
+  @Post(':orgId/credit-groups')
+  @UseGuards(JwtAccessGuard)
+  createCreditGroup(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Body() dto: CreateCreditGroupDto,
+  ) {
+    return this.orgService.createCreditGroup(actor.userId, orgId, dto);
+  }
+
+  @Get(':orgId/credit-groups')
+  @UseGuards(JwtAccessGuard)
+  listCreditGroups(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+  ) {
+    return this.orgService.listCreditGroups(actor.userId, orgId);
+  }
+
+  @Get(':orgId/credit-groups/:creditGroupId')
+  @UseGuards(JwtAccessGuard)
+  getCreditGroup(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+  ) {
+    return this.orgService.getCreditGroup(actor.userId, orgId, creditGroupId);
+  }
+
+  @Patch(':orgId/credit-groups/:creditGroupId')
+  @UseGuards(JwtAccessGuard)
+  updateCreditGroup(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+    @Body() dto: UpdateCreditGroupDto,
+  ) {
+    return this.orgService.updateCreditGroup(actor.userId, orgId, creditGroupId, dto);
+  }
+
+  @Delete(':orgId/credit-groups/:creditGroupId')
+  @UseGuards(JwtAccessGuard)
+  deleteCreditGroup(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+  ) {
+    return this.orgService.deleteCreditGroup(actor.userId, orgId, creditGroupId);
+  }
+
+  @Post(':orgId/credit-groups/:creditGroupId/fees')
+  @UseGuards(JwtAccessGuard)
+  setCreditGroupFee(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+    @Body() dto: SetCreditGroupFeeDto,
+  ) {
+    return this.orgService.setCreditGroupFee(actor.userId, orgId, creditGroupId, dto);
+  }
+
+  @Get(':orgId/credit-groups/:creditGroupId/fees')
+  @UseGuards(JwtAccessGuard)
+  listCreditGroupFees(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+  ) {
+    return this.orgService.listCreditGroupFees(actor.userId, orgId, creditGroupId);
+  }
+
+  @Post(':orgId/credit-groups/:creditGroupId/members')
+  @UseGuards(JwtAccessGuard)
+  addCreditGroupMember(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+    @Body() dto: AddCreditGroupMemberDto,
+  ) {
+    return this.orgService.addCreditGroupMember(actor.userId, orgId, creditGroupId, dto);
+  }
+
+  @Get(':orgId/credit-groups/:creditGroupId/members')
+  @UseGuards(JwtAccessGuard)
+  listCreditGroupMembers(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+  ) {
+    return this.orgService.listCreditGroupMembers(actor.userId, orgId, creditGroupId);
+  }
+
+  @Delete(':orgId/credit-groups/:creditGroupId/members/:userId')
+  @UseGuards(JwtAccessGuard)
+  removeCreditGroupMember(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('creditGroupId', ParseUUIDPipe) creditGroupId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+  ) {
+    return this.orgService.removeCreditGroupMember(actor.userId, orgId, creditGroupId, userId);
   }
 
   // --- Membership ----------------------------------------------------------

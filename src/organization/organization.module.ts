@@ -13,6 +13,9 @@ import { User } from '../entities/user.entity';
 import { OrgFee } from '../entities/org-fee.entity';
 import { CreditHistory } from '../entities/credit-history.entity';
 import { CreditResource } from '../entities/credit-resource.entity';
+import { CreditGroup } from '../entities/credit-group.entity';
+import { CreditGroupFee } from '../entities/credit-group-fee.entity';
+import { CreditGroupMember } from '../entities/credit-group-member.entity';
 
 @Module({
   imports: [
@@ -27,6 +30,9 @@ import { CreditResource } from '../entities/credit-resource.entity';
       OrgFee,
       CreditHistory,
       CreditResource,
+      CreditGroup,
+      CreditGroupFee,
+      CreditGroupMember,
     ]),
   ],
   controllers: [OrganizationController],

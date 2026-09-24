@@ -31,6 +31,7 @@ import { LockShipmentDto } from './dto/lock-shipment.dto';
 import { UpdateShipmentStatusDto } from './dto/update-shipment-status.dto';
 import { ShipmentItemDto } from './dto/shipment-item.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
+import { creditCommission, resolveClientFee } from '../common/credit-group.util';
 
 /** Status moves the **client** (owner) may make while the shipment is unlocked. */
 const CLIENT_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
@@ -542,14 +543,23 @@ export class ShipmentService {
       const feeRow = await em.findOne(OrgFee, {
         where: { orgId: shipment.orgId, feeType: FeeType.SHIPMENT_LOCK },
       });
-      const fee = feeRow?.amount ?? 0;
+      // The org's flat fee is the warehouse's base cut. A credit group the client
+      // belongs to overrides it as what the client pays; the owner earns the markup.
+      const base = feeRow?.amount ?? 0;
+      const { charged, ownerId } = await resolveClientFee(
+        em,
+        shipment.orgId,
+        shipment.userId,
+        FeeType.SHIPMENT_LOCK,
+        base,
+      );
 
       // Always record the lock fee as a protected (non-voidable) row, so it shows up
       // in the shipment's fee list alongside any extra fees — even when it is 0.
       const lockFee = await em.save(
         em.create(TotalFee, {
           name: 'Shipment lock fee',
-          amount: fee,
+          amount: charged,
           isProtected: true,
           orgId: shipment.orgId,
           orderId: null,
@@ -559,7 +569,7 @@ export class ShipmentService {
         }),
       );
 
-      if (fee > 0) {
+      if (charged > 0) {
         const rows: Array<{ credit: string }> = await em.query(
           `SELECT credit FROM wh.users WHERE id = $1 FOR UPDATE`,
           [shipment.userId],
@@ -567,10 +577,10 @@ export class ShipmentService {
         if (rows.length === 0) throw new NotFoundException('Shipment client not found');
 
         const prevBalance = parseFloat(rows[0].credit);
-        if (prevBalance < fee) {
+        if (prevBalance < charged) {
           throw new BadRequestException('Client has insufficient credit to lock this shipment');
         }
-        const newBalance = prevBalance - fee;
+        const newBalance = prevBalance - charged;
 
         await em.update(User, { id: shipment.userId }, { credit: newBalance });
 
@@ -579,7 +589,7 @@ export class ShipmentService {
             userId: shipment.userId,
             orgId: shipment.orgId,
             entryType: CreditEntryType.SHIPMENT_LOCK,
-            amount: -fee,
+            amount: -charged,
             prevBalance,
             newBalance,
             shipmentId: shipment.id,
@@ -587,6 +597,20 @@ export class ShipmentService {
             note: dto.note ?? null,
           }),
         );
+      }
+
+      // Credit the credit group's owner the markup (group fee − org fee); the
+      // warehouse keeps only the org base.
+      const markup = charged - base;
+      if (ownerId && markup > 0) {
+        await creditCommission(em, {
+          ownerId,
+          orgId: shipment.orgId,
+          amount: markup,
+          shipmentId: shipment.id,
+          feeId: lockFee.id,
+          note: dto.note ?? null,
+        });
       }
 
       // 2. Deduct each line's qty from the order line item it draws from. Each
