@@ -29,12 +29,21 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
+import { AdjustCreditDto } from './dto/adjust-credit.dto';
 import { CreateCreditGroupDto } from './dto/create-credit-group.dto';
 import { UpdateCreditGroupDto } from './dto/update-credit-group.dto';
 import { SetCreditGroupFeeDto } from './dto/set-credit-group-fee.dto';
 import { AddCreditGroupMemberDto } from './dto/add-credit-group-member.dto';
 import { decodeCursor, parseLimit, toPage } from '../common/pagination.util';
 import { attachBillFlag, BILL_URL_TTL_SECONDS } from '../common/credit-bill.util';
+import {
+  applyLedgerFilters,
+  joinLedgerRefs,
+  LedgerFilters,
+  SPEND_ENTRY_TYPES,
+  summarizeLedger,
+  summarizeLedgerByDay,
+} from '../common/credit-ledger.util';
 import { StorageService } from '../storage/storage.service';
 import { UploadedFile } from '../common/uploaded-file.util';
 
@@ -107,13 +116,13 @@ export class OrganizationService {
     return this.userOrgRepo.save(membership);
   }
 
-  async listMembers(orgId: string) {
+  async listMembers(actingUserId: string, orgId: string) {
     await this.getOrganization(orgId);
     const memberships = await this.userOrgRepo.find({
       where: { orgId },
       relations: { user: true },
     });
-    if (memberships.length === 0) return memberships;
+    if (memberships.length === 0) return [];
 
     // Attach each member's groups (roles), scoped to this org, so the admin
     // users table can show who sits in which group. Batched to avoid N+1: one
@@ -139,8 +148,19 @@ export class OrganizationService {
       groupsByUser.set(ug.userId, list);
     }
 
+    // Safe user columns only (never the password hash); the wallet balance is only
+    // exposed to balance viewers/managers (admins pass).
+    const canViewBalances = await this.canViewBalances(orgId, actingUserId);
+
     return memberships.map((m) => ({
       ...m,
+      user: {
+        id: m.user.id,
+        email: m.user.email,
+        displayName: m.user.displayName,
+        code: m.user.code,
+        ...(canViewBalances ? { credit: m.user.credit } : {}),
+      },
       groups: groupsByUser.get(m.userId) ?? [],
     }));
   }
@@ -674,17 +694,53 @@ export class OrganizationService {
 
   /**
    * Add funds to a member's credit, recording a `TOP_UP` ledger entry. Gated by the
-   * `manage_org_members` permission (via API_PERMISSION_MAP): the people who manage
-   * an org's members also manage their top-ups. The acting user must belong to the
-   * org (admins excepted) and the target must be a member of it. The balance read,
-   * update and ledger row run in one transaction with a `FOR UPDATE` row lock so
-   * concurrent top-ups (or an order-lock charge) can't race.
+   * `manage_user_balances` permission (via API_PERMISSION_MAP); see
+   * {@link applyMemberCreditChange} for the membership rules and locking.
    */
   async topUpCredit(
     actingUserId: string,
     orgId: string,
     targetUserId: string,
     dto: TopUpCreditDto,
+  ) {
+    return this.applyMemberCreditChange(actingUserId, orgId, targetUserId, {
+      entryType: CreditEntryType.TOP_UP,
+      amount: dto.amount,
+      note: dto.note ?? null,
+    });
+  }
+
+  /**
+   * Manually correct a member's credit by a signed amount, recording an `ADJUSTMENT`
+   * ledger entry with a required note — e.g. a goodwill credit or reversing a
+   * mistaken top-up. Gated by `manage_user_balances` (via API_PERMISSION_MAP), with
+   * the same membership rules and row lock as {@link topUpCredit}. A deduction that
+   * would take the balance below zero is rejected with a 400.
+   */
+  async adjustCredit(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    dto: AdjustCreditDto,
+  ) {
+    return this.applyMemberCreditChange(actingUserId, orgId, targetUserId, {
+      entryType: CreditEntryType.ADJUSTMENT,
+      amount: dto.amount,
+      note: dto.note,
+    });
+  }
+
+  /**
+   * Shared write path for manager-initiated credit changes (top-ups, adjustments):
+   * the acting user must belong to the org (admins excepted) and the target must be
+   * a member of it. The balance read, update and ledger row run in one transaction
+   * with a `FOR UPDATE` row lock so concurrent changes (or a lock charge) can't race.
+   */
+  private async applyMemberCreditChange(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    change: { entryType: CreditEntryType; amount: number; note: string | null },
   ) {
     await this.getOrganization(orgId);
     await this.assertOrgMembership(orgId, actingUserId);
@@ -700,7 +756,10 @@ export class OrganizationService {
       if (rows.length === 0) throw new NotFoundException('User not found');
 
       const prevBalance = parseFloat(rows[0].credit);
-      const newBalance = prevBalance + dto.amount;
+      const newBalance = prevBalance + change.amount;
+      if (newBalance < 0) {
+        throw new BadRequestException('Adjustment would make the balance negative');
+      }
 
       await em.update(User, { id: targetUserId }, { credit: newBalance });
 
@@ -708,12 +767,12 @@ export class OrganizationService {
         em.create(CreditHistory, {
           userId: targetUserId,
           orgId,
-          entryType: CreditEntryType.TOP_UP,
-          amount: dto.amount,
+          entryType: change.entryType,
+          amount: change.amount,
           prevBalance,
           newBalance,
           orderId: null,
-          note: dto.note ?? null,
+          note: change.note,
         }),
       );
 
@@ -726,44 +785,38 @@ export class OrganizationService {
    * changes recorded in this org (charges and top-ups), newest first and keyset-
    * paginated by `(created_at, id)` — for the member to review their own spend, or a
    * manager to review theirs. Readable by the member themselves, a system admin, or
-   * a `manage_org_members` holder in the org.
+   * a `view_user_balances` / `manage_user_balances` holder in the org.
    *
    * `credit` is the member's total wallet balance (a single pool across all orgs);
    * `history` is scoped to this org, so a manager of one org never sees another
    * org's activity. Each ledger row still carries its own `prevBalance`/`newBalance`
-   * snapshot, so an org-filtered row remains self-consistent.
+   * snapshot, so an org-filtered row remains self-consistent. Optional `filters`
+   * narrow by entry type and date window (`filters.orgId` is ignored — the org is
+   * pinned); each row carries its linked `order` / `shipment` / `fee`.
    */
   async getMemberCredit(
     actingUserId: string,
     orgId: string,
     targetUserId: string,
+    filters: LedgerFilters,
     limitRaw?: string,
     cursor?: string,
   ) {
-    await this.getOrganization(orgId);
-    const actor = await this.ensureUserExists(actingUserId);
-
-    // Self, system admin, or a member-manager in this org may view it.
-    if (actingUserId !== targetUserId && !actor.isAdmin) {
-      const canManage = await this.hasOrgPermission(orgId, actingUserId, 'manage_org_members');
-      if (!canManage) throw new ForbiddenException("You cannot view this member's credit");
-    }
-
-    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: targetUserId } });
-    if (!membership) throw new NotFoundException('User is not a member of this organization');
-
-    const target = await this.ensureUserExists(targetUserId);
+    const target = await this.loadViewableMemberCredit(actingUserId, orgId, targetUserId);
 
     const limit = parseLimit(limitRaw);
-    const qb = this.creditHistoryRepo
-      .createQueryBuilder('c')
-      .leftJoin('c.resource', 'resource')
-      .addSelect('resource.id')
+    const qb = joinLedgerRefs(
+      this.creditHistoryRepo
+        .createQueryBuilder('c')
+        .leftJoin('c.resource', 'resource')
+        .addSelect('resource.id'),
+    )
       .where('c.userId = :userId', { userId: targetUserId })
       .andWhere('c.orgId = :orgId', { orgId })
       .orderBy('c.createdAt', 'DESC')
       .addOrderBy('c.id', 'DESC')
       .take(limit + 1);
+    applyLedgerFilters(qb, { ...filters, orgId: undefined });
 
     if (cursor) {
       const { t, id } = decodeCursor(cursor);
@@ -777,13 +830,234 @@ export class OrganizationService {
     return { userId: target.id, orgId, credit: target.credit, history };
   }
 
+  /**
+   * Summary totals over a member's ledger **in this org** — the org-scoped
+   * counterpart of `UserService.getMyCreditSummary`, authorized like
+   * {@link getMemberCredit}. `credit` is still the member's global wallet balance.
+   */
+  async getMemberCreditSummary(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+    filters: LedgerFilters,
+  ) {
+    const target = await this.loadViewableMemberCredit(actingUserId, orgId, targetUserId);
+
+    const qb = this.creditHistoryRepo
+      .createQueryBuilder('c')
+      .where('c.userId = :userId', { userId: targetUserId })
+      .andWhere('c.orgId = :orgId', { orgId });
+    applyLedgerFilters(qb, { ...filters, orgId: undefined });
+
+    const summary = await summarizeLedger(qb);
+    return {
+      userId: target.id,
+      orgId,
+      credit: target.credit,
+      from: filters.from ?? null,
+      to: filters.to ?? null,
+      ...summary,
+    };
+  }
+
+  /**
+   * Every member of the org with their wallet balance, for a manager's balances
+   * overview: `credit` is the member's **global** balance (the wallet spans orgs),
+   * while `spent` / `toppedUp` are this org's ledger within the optional
+   * `from`/`to` window (spend nets `ORDER_LOCK` / `SHIPMENT_LOCK` / `EXTRA_FEE`, like
+   * the summary) and `lastActivityAt` is the member's latest ledger row in this org
+   * regardless of the window. One grouped query; unpaginated, like `listMembers`.
+   * `totals` sums the same columns across all members. Gated by
+   * `view_user_balances` or `manage_user_balances` via PERMISSION_API_MAP.
+   */
+  async listMemberBalances(orgId: string, filters: LedgerFilters) {
+    await this.getOrganization(orgId);
+
+    const window = [
+      filters.from ? 'c.createdAt >= :from' : null,
+      filters.to ? 'c.createdAt < :to' : null,
+    ]
+      .filter(Boolean)
+      .map((cond) => ` AND ${cond}`)
+      .join('');
+
+    const rows = await this.userOrgRepo
+      .createQueryBuilder('uo')
+      .innerJoin('uo.user', 'u')
+      .leftJoin(CreditHistory, 'c', 'c.userId = uo.userId AND c.orgId = uo.orgId')
+      .select('u.id', 'userId')
+      .addSelect('u.email', 'email')
+      .addSelect('u.displayName', 'displayName')
+      .addSelect('u.code', 'code')
+      .addSelect('u.credit', 'credit')
+      .addSelect(
+        `COALESCE(SUM(-c.amount) FILTER (WHERE c.entryType IN (:...spendTypes)${window}), 0)`,
+        'spent',
+      )
+      .addSelect(
+        `COALESCE(SUM(c.amount) FILTER (WHERE c.entryType = :topUp${window}), 0)`,
+        'toppedUp',
+      )
+      .addSelect('MAX(c.createdAt)', 'lastActivityAt')
+      .where('uo.orgId = :orgId', { orgId })
+      .setParameters({
+        spendTypes: SPEND_ENTRY_TYPES,
+        topUp: CreditEntryType.TOP_UP,
+        ...(filters.from ? { from: filters.from } : {}),
+        ...(filters.to ? { to: filters.to } : {}),
+      })
+      .groupBy('u.id')
+      .orderBy('u.credit', 'ASC')
+      .addOrderBy('u.email', 'ASC')
+      .getRawMany<{
+        userId: string;
+        email: string;
+        displayName: string | null;
+        code: string | null;
+        credit: string;
+        spent: string;
+        toppedUp: string;
+        lastActivityAt: Date | null;
+      }>();
+
+    const items = rows.map((r) => ({
+      userId: r.userId,
+      email: r.email,
+      displayName: r.displayName,
+      code: r.code,
+      credit: parseFloat(r.credit),
+      spent: parseFloat(r.spent),
+      toppedUp: parseFloat(r.toppedUp),
+      lastActivityAt: r.lastActivityAt,
+    }));
+
+    const totals = items.reduce(
+      (acc, item) => ({
+        members: acc.members + 1,
+        credit: acc.credit + item.credit,
+        spent: acc.spent + item.spent,
+        toppedUp: acc.toppedUp + item.toppedUp,
+        emptyBalances: acc.emptyBalances + (item.credit <= 0 ? 1 : 0),
+      }),
+      { members: 0, credit: 0, spent: 0, toppedUp: 0, emptyBalances: 0 },
+    );
+
+    return {
+      orgId,
+      from: filters.from ?? null,
+      to: filters.to ?? null,
+      totals,
+      items,
+    };
+  }
+
+  /**
+   * The org's whole credit ledger — every member's entries recorded in this org —
+   * newest first and keyset-paginated like the per-member ledger, for an accountant's
+   * activity view. Optional `filters` narrow by entry type, date window and member
+   * (`userId`). Each row carries its linked `order` / `shipment` / `fee` plus the
+   * member (`user`: safe columns only) and a `hasBill` flag. Gated by
+   * `view_user_balances` or `manage_user_balances` via PERMISSION_API_MAP.
+   */
+  async listOrgLedger(orgId: string, filters: LedgerFilters, limitRaw?: string, cursor?: string) {
+    await this.getOrganization(orgId);
+
+    const limit = parseLimit(limitRaw);
+    const qb = joinLedgerRefs(
+      this.creditHistoryRepo
+        .createQueryBuilder('c')
+        .leftJoin('c.resource', 'resource')
+        .addSelect('resource.id')
+        .innerJoin('c.user', 'user')
+        .addSelect(['user.id', 'user.email', 'user.displayName', 'user.code']),
+    )
+      .where('c.orgId = :orgId', { orgId })
+      .orderBy('c.createdAt', 'DESC')
+      .addOrderBy('c.id', 'DESC')
+      .take(limit + 1);
+    applyLedgerFilters(qb, { ...filters, orgId: undefined });
+
+    if (cursor) {
+      const { t, id } = decodeCursor(cursor);
+      qb.andWhere('(c.createdAt < :t OR (c.createdAt = :t AND c.id < :id))', {
+        t: new Date(t),
+        id,
+      });
+    }
+
+    return { orgId, history: attachBillFlag(toPage(await qb.getMany(), limit)) };
+  }
+
+  /**
+   * Totals over the org's whole ledger (all members, or one via `filters.userId`) —
+   * the org-wide counterpart of `getMemberCreditSummary`, same gate as
+   * {@link listOrgLedger}.
+   */
+  async getOrgCreditSummary(orgId: string, filters: LedgerFilters) {
+    await this.getOrganization(orgId);
+
+    const qb = this.creditHistoryRepo.createQueryBuilder('c').where('c.orgId = :orgId', { orgId });
+    applyLedgerFilters(qb, { ...filters, orgId: undefined });
+
+    return {
+      orgId,
+      from: filters.from ?? null,
+      to: filters.to ?? null,
+      ...(await summarizeLedger(qb)),
+    };
+  }
+
+  /**
+   * The org's whole ledger rolled up per calendar day in `tz`, newest first — money
+   * out, money in and entry count across all members (or one via `filters.userId`).
+   * No closing balance: balances are per member. Same gate as {@link listOrgLedger}.
+   */
+  async getOrgCreditDaily(orgId: string, filters: LedgerFilters, tz: string) {
+    await this.getOrganization(orgId);
+
+    const qb = this.creditHistoryRepo.createQueryBuilder('c').where('c.orgId = :orgId', { orgId });
+    applyLedgerFilters(qb, { ...filters, orgId: undefined });
+
+    const days = await summarizeLedgerByDay(qb, tz);
+    return {
+      orgId,
+      tz,
+      days: days.map(({ date, spent, added, count }) => ({ date, spent, added, count })),
+    };
+  }
+
+  /**
+   * Shared gate for reading a member's credit: the caller must be the member, a
+   * system admin, or a balance viewer/manager in the org, and the target must
+   * belong to the org. Returns the target user.
+   */
+  private async loadViewableMemberCredit(
+    actingUserId: string,
+    orgId: string,
+    targetUserId: string,
+  ) {
+    await this.getOrganization(orgId);
+    const actor = await this.ensureUserExists(actingUserId);
+
+    // Self, system admin, or a balance viewer/manager in this org may view it.
+    if (actingUserId !== targetUserId && !actor.isAdmin) {
+      const canView = await this.canViewBalances(orgId, actingUserId);
+      if (!canView) throw new ForbiddenException("You cannot view this member's credit");
+    }
+
+    const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: targetUserId } });
+    if (!membership) throw new NotFoundException('User is not a member of this organization');
+
+    return this.ensureUserExists(targetUserId);
+  }
+
   // --- Top-up bills (receipt images) --------------------------------------
 
   /**
    * Attach (or replace) the bill/receipt image on a `TOP_UP` ledger entry. One
    * bill per entry: a re-upload deletes the previous object first. Only the image
    * moves — the top-up's amount/note/balances stay immutable. Gated by
-   * `manage_org_members` (same as the top-up itself, via API_PERMISSION_MAP); the
+   * `manage_user_balances` (same as the top-up itself, via API_PERMISSION_MAP); the
    * acting user must belong to the org and the entry must be this org's TOP_UP for
    * the target member. Bills auto-expire after two weeks — see {@link expireOldBills}.
    */
@@ -828,7 +1102,7 @@ export class OrganizationService {
    * Issue a **presigned URL** for a top-up's bill so the browser loads it directly
    * from the bucket — no bytes through the API. Valid for `BILL_URL_TTL_SECONDS`; the
    * FE re-requests when it expires. Readable by the member themselves, a system admin,
-   * or a `manage_org_members` holder in the org (same rule as {@link getMemberCredit});
+   * or a balance viewer/manager in the org (same rule as {@link getMemberCredit});
    * only issuing the URL is gated. 404 if the entry has no bill. Pass `download` to
    * force a save dialog instead of inline render.
    */
@@ -849,7 +1123,7 @@ export class OrganizationService {
     return { url, expiresIn: BILL_URL_TTL_SECONDS, contentType: resource.contentType };
   }
 
-  /** Authorize the caller (self / admin / member-manager) and load the bill, or throw. */
+  /** Authorize the caller (self / admin / balance viewer or manager) and load the bill, or throw. */
   private async resolveViewableBill(
     actingUserId: string,
     orgId: string,
@@ -859,8 +1133,8 @@ export class OrganizationService {
     await this.getOrganization(orgId);
     const actor = await this.ensureUserExists(actingUserId);
     if (actingUserId !== targetUserId && !actor.isAdmin) {
-      const canManage = await this.hasOrgPermission(orgId, actingUserId, 'manage_org_members');
-      if (!canManage) throw new ForbiddenException("You cannot view this member's bill");
+      const canView = await this.canViewBalances(orgId, actingUserId);
+      if (!canView) throw new ForbiddenException("You cannot view this member's bill");
     }
 
     const entry = await this.loadTopUpEntry(orgId, targetUserId, entryId);
@@ -945,6 +1219,14 @@ export class OrganizationService {
    * admins always do. Used for row-level scoping (e.g. `process_order` staff see
    * every order in the org, while a plain `place_order` client sees only theirs).
    */
+  /** Whether the user may read other members' balances in the org (either balance permission). */
+  private async canViewBalances(orgId: string, userId: string): Promise<boolean> {
+    return (
+      (await this.hasOrgPermission(orgId, userId, 'view_user_balances')) ||
+      (await this.hasOrgPermission(orgId, userId, 'manage_user_balances'))
+    );
+  }
+
   async hasOrgPermission(orgId: string, userId: string, permissionName: string): Promise<boolean> {
     const user = await this.ensureUserExists(userId);
     if (user.isAdmin) return true;

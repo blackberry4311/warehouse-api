@@ -37,12 +37,27 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   manage_org_members: [
     'post /organizations/:orgId/members',
     'delete /organizations/:orgId/members/:userId',
-    // Managing members includes managing their credit top-ups and top-up bills.
+  ],
+  view_org_members: ['get /organizations/:orgId/members'],
+  // Member balances (credit wallets). Reading a member's ledger / summary / bill is
+  // authenticated-only and authorized in OrganizationService (self, admin, or either
+  // permission below); only the org-wide listing and the writes are mapped here.
+  view_user_balances: [
+    'get /organizations/:orgId/credit/balances',
+    'get /organizations/:orgId/credit/ledger',
+    'get /organizations/:orgId/credit/summary',
+    'get /organizations/:orgId/credit/daily',
+  ],
+  manage_user_balances: [
+    'get /organizations/:orgId/credit/balances',
+    'get /organizations/:orgId/credit/ledger',
+    'get /organizations/:orgId/credit/summary',
+    'get /organizations/:orgId/credit/daily',
     'post /organizations/:orgId/members/:userId/credit',
+    'post /organizations/:orgId/members/:userId/credit/adjustments',
     'put /organizations/:orgId/members/:userId/credit/:entryId/bill',
     'delete /organizations/:orgId/members/:userId/credit/:entryId/bill',
   ],
-  view_org_members: ['get /organizations/:orgId/members'],
   view_user_permissions: ['get /organizations/:orgId/members/:userId/permissions'],
 
   // Groups

@@ -8,6 +8,13 @@ import { UserOrg } from '../entities/user-org.entity';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { decodeCursor, parseLimit, toPage } from '../common/pagination.util';
 import { attachBillFlag } from '../common/credit-bill.util';
+import {
+  applyLedgerFilters,
+  joinLedgerRefs,
+  LedgerFilters,
+  summarizeLedger,
+  summarizeLedgerByDay,
+} from '../common/credit-ledger.util';
 
 /**
  * Self-service for the authenticated user: read/update their own profile and
@@ -120,20 +127,24 @@ export class UserService {
    * first and keyset-paginated by `(created_at, id)` — backed by the
    * `credit_history (user_id_fk, created_at desc, id desc)` index. Contrast with
    * `OrganizationService.getMemberCredit`, which scopes the ledger to one org for a
-   * member-manager's view.
+   * member-manager's view. Optional `filters` narrow by entry type, date window and
+   * org; each row carries its linked `order` / `shipment` / `fee` (see `joinLedgerRefs`).
    */
-  async getMyCredit(userId: string, limitRaw?: string, cursor?: string) {
+  async getMyCredit(userId: string, filters: LedgerFilters, limitRaw?: string, cursor?: string) {
     const user = await this.ensureUserExists(userId);
 
     const limit = parseLimit(limitRaw);
-    const qb = this.creditHistoryRepo
-      .createQueryBuilder('c')
-      .leftJoin('c.resource', 'resource')
-      .addSelect('resource.id')
+    const qb = joinLedgerRefs(
+      this.creditHistoryRepo
+        .createQueryBuilder('c')
+        .leftJoin('c.resource', 'resource')
+        .addSelect('resource.id'),
+    )
       .where('c.userId = :userId', { userId })
       .orderBy('c.createdAt', 'DESC')
       .addOrderBy('c.id', 'DESC')
       .take(limit + 1);
+    applyLedgerFilters(qb, filters);
 
     if (cursor) {
       const { t, id } = decodeCursor(cursor);
@@ -145,6 +156,45 @@ export class UserService {
 
     const history = attachBillFlag(toPage(await qb.getMany(), limit));
     return { userId: user.id, credit: user.credit, history };
+  }
+
+  /**
+   * Totals over the caller's ledger (all orgs unless `filters.orgId` narrows it) for
+   * the wallet's summary cards: per-entry-type net amounts and counts, plus the net
+   * `spent` and `toppedUp`, within the optional `from`/`to` window.
+   */
+  async getMyCreditSummary(userId: string, filters: LedgerFilters) {
+    const user = await this.ensureUserExists(userId);
+
+    const qb = this.creditHistoryRepo
+      .createQueryBuilder('c')
+      .where('c.userId = :userId', { userId });
+    applyLedgerFilters(qb, filters);
+
+    const summary = await summarizeLedger(qb);
+    return {
+      userId: user.id,
+      credit: user.credit,
+      from: filters.from ?? null,
+      to: filters.to ?? null,
+      ...summary,
+    };
+  }
+
+  /**
+   * The caller's ledger rolled up per calendar day in `tz` (newest first): money
+   * out, money in, entry count and closing balance — exact over the whole filtered
+   * slice, for the wallet's day-by-day view. Unpaginated (one row per active day).
+   */
+  async getMyCreditDaily(userId: string, filters: LedgerFilters, tz: string) {
+    await this.ensureUserExists(userId);
+
+    const qb = this.creditHistoryRepo
+      .createQueryBuilder('c')
+      .where('c.userId = :userId', { userId });
+    applyLedgerFilters(qb, filters);
+
+    return { userId, tz, days: await summarizeLedgerByDay(qb, tz) };
   }
 
   private toProfile(user: User) {

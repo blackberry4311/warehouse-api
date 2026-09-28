@@ -1,9 +1,10 @@
-import { Body, Controller, Get, Patch, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, ParseUUIDPipe, Patch, Query, UseGuards } from '@nestjs/common';
 import { JwtAccessGuard } from '../auth/guards/jwt-access.guard';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/interfaces/jwt-payload.interface';
 import { UserService } from './user.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { parseLedgerFilters, parseTimeZone } from '../common/credit-ledger.util';
 
 /**
  * Self-service endpoints for the authenticated user, scoped entirely to `/me`.
@@ -46,13 +47,54 @@ export class UserController {
   }
 
   // The caller's wallet balance + their global credit ledger (all orgs),
-  // newest first and cursor-paginated (limit/cursor).
+  // newest first and cursor-paginated (limit/cursor). Optional filters: ?type=
+  // (comma-separated entry types), ?from= / ?to= (dates, to exclusive), ?orgId=.
   @Get('me/credit')
   getMyCredit(
     @CurrentUser() user: AuthenticatedUser,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('orgId', new ParseUUIDPipe({ optional: true })) orgId?: string,
   ) {
-    return this.userService.getMyCredit(user.userId, limit, cursor);
+    const filters = parseLedgerFilters({ type, from, to, orgId });
+    return this.userService.getMyCredit(user.userId, filters, limit, cursor);
+  }
+
+  // Per-day totals (spent / added / count / closing balance) over the caller's
+  // ledger, bucketed by calendar day in ?tz= (IANA, default UTC), with the same
+  // optional type/from/to/orgId filters.
+  @Get('me/credit/daily')
+  getMyCreditDaily(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('orgId', new ParseUUIDPipe({ optional: true })) orgId?: string,
+    @Query('tz') tz?: string,
+  ) {
+    return this.userService.getMyCreditDaily(
+      user.userId,
+      parseLedgerFilters({ type, from, to, orgId }),
+      parseTimeZone(tz),
+    );
+  }
+
+  // Wallet summary cards: per-entry-type totals + net spent / topped up over the
+  // caller's ledger, with the same optional type/from/to/orgId filters.
+  @Get('me/credit/summary')
+  getMyCreditSummary(
+    @CurrentUser() user: AuthenticatedUser,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('orgId', new ParseUUIDPipe({ optional: true })) orgId?: string,
+  ) {
+    return this.userService.getMyCreditSummary(
+      user.userId,
+      parseLedgerFilters({ type, from, to, orgId }),
+    );
   }
 }

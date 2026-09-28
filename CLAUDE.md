@@ -190,17 +190,22 @@ class-validator decorators and unknown properties are rejected.
 - Orgs: `POST /organizations`, `GET /organizations`, `GET /organizations/:orgId`.
 - Users: `POST /organizations/users` (requires `add_user`; auto-attaches to the caller's org).
 - Members: `POST|GET /organizations/:orgId/members`, `DELETE /organizations/:orgId/members/:userId`,
-  `GET /organizations/:orgId/members/:userId/permissions` (resolves effective permissions).
-- Member credit: `POST /organizations/:orgId/members/:userId/credit` (requires `manage_org_members`)
-  tops a member up (writes a `TOP_UP` ledger row); `GET /organizations/:orgId/members/:userId/credit`
+  `GET /organizations/:orgId/members/:userId/permissions` (resolves effective permissions). The `GET`
+  list returns each member's `user` as safe columns only (`id`, `email`, `displayName`, `code` — never
+  `password_hash`), plus `credit` only when the caller holds `view_user_balances` / `manage_user_balances`.
+- Member credit: `POST /organizations/:orgId/members/:userId/credit` (requires `manage_user_balances`)
+  tops a member up (writes a `TOP_UP` ledger row); `POST .../credit/adjustments` (requires
+  `manage_user_balances`) corrects it by a signed amount with a required note (`ADJUSTMENT` row); `GET /organizations/:orgId/members/:userId/credit`
   returns `{ userId, orgId, credit, history }` — the member's wallet balance plus their org-scoped
-  ledger, cursor-paginated (each ledger row carries a `hasBill` boolean). See **Credit / billing** below.
+  ledger, cursor-paginated (each ledger row carries a `hasBill` boolean), filterable by `type`/`from`/`to`;
+  `GET .../credit/summary` returns totals over the same slice. `GET /organizations/:orgId/credit/balances`
+  (requires `view_user_balances` or `manage_user_balances`) lists every member's balance with org totals. See **Credit / billing** below.
 - Top-up bills: `PUT /organizations/:orgId/members/:userId/credit/:entryId/bill` (requires
-  `manage_org_members`) attaches **or replaces** the bill/receipt image on a `TOP_UP` entry
+  `manage_user_balances`) attaches **or replaces** the bill/receipt image on a `TOP_UP` entry
   (`multipart/form-data`, one file field; jpeg/png/webp/pdf, ≤10 MB — only the image changes, the
   top-up's amount/note/balances stay immutable). `DELETE .../credit/:entryId/bill` (requires
-  `manage_org_members`) removes it. `GET .../credit/:entryId/bill` (authenticated-only; the service
-  authorizes self / admin / `manage_org_members`, like the credit read) returns a **presigned URL**
+  `manage_user_balances`) removes it. `GET .../credit/:entryId/bill` (authenticated-only; the service
+  authorizes self / admin / `view_user_balances` / `manage_user_balances`, like the credit read) returns a **presigned URL**
   `{ url, expiresIn, contentType }` so the FE loads the image straight from the bucket, never proxying
   bytes through the API (`?download=true` forces a save dialog); the URL is valid for
   `BILL_URL_TTL_SECONDS` (7 days). See **Credit / billing** → **Top-up bills**.
@@ -558,15 +563,52 @@ endpoint); there is no separate module.
   `order_id_fk`) — again subject to the client's **credit group** override. See the **Shipment system** above.
 - **Top-ups.** `POST /organizations/:orgId/members/:userId/credit` (`TopUpCreditDto`: `amount > 0`,
   optional `note`) adds funds and writes a `TOP_UP` ledger row, in a `FOR UPDATE` transaction. Gated by
-  **`manage_org_members`** (whoever manages members manages their top-ups); the acting user must belong
+  **`manage_user_balances`**; the acting user must belong
   to the org (admins excepted) and the target must be a member of it.
+- **Adjustments.** `POST /organizations/:orgId/members/:userId/credit/adjustments` (`AdjustCreditDto`:
+  signed `amount ≠ 0`, ≤2 decimals; required `note`) writes an `ADJUSTMENT` ledger row — e.g. a goodwill
+  credit or reversing a mistaken top-up. Gated by **`manage_user_balances`**. Shares
+  `applyMemberCreditChange` with top-ups (same membership rules and `FOR UPDATE` transaction); a
+  deduction that would take the balance below 0 is a `400`.
 - **Reviewing credit.** `GET /organizations/:orgId/members/:userId/credit` returns
   `{ userId, orgId, credit, history }` — the member's **global** wallet balance plus the ledger entries
   **scoped to this org**, newest first, cursor-paginated (same `limit`/`cursor` keyset scheme as the
   order lists). Authenticated-only (`JwtAccessGuard`); `OrganizationService.getMemberCredit` authorizes
-  the caller as **self, a system admin, or a `manage_org_members` holder** in the org. Each ledger row
+  the caller as **self, a system admin, or a `view_user_balances` / `manage_user_balances` holder** in
+  the org (`canViewBalances`). Each ledger row
   carries its own `prevBalance`/`newBalance` snapshot, so an org-filtered row stays self-consistent
   even though the wallet itself spans orgs.
+- **Ledger filters, refs and summary** (`src/common/credit-ledger.util.ts`, shared by both ledger read
+  paths). Optional query filters: `type` (comma-separated `CreditEntryType`, unknown values dropped),
+  `from` (inclusive) / `to` (exclusive) dates (400 if unparseable or `from >= to`), and `orgId` (only on
+  `/users/me/credit*`; the org-scoped path pins its org). Each row also carries its linked `order`
+  (`{ id, orderNumber }`), `shipment` (`{ id, shipmentNumber }`) and `fee` (`{ id, name, voidedAt }`),
+  each `null` when unset (`joinLedgerRefs`). `GET .../credit/summary` (same auth + filters, no paging)
+  returns `{ userId, [orgId], credit, from, to, totals, spent, toppedUp }` from one `GROUP BY
+  entry_type`: `totals` maps every entry type to `{ amount, count }` (zero-filled, signed net),
+  `spent` = `-SUM(amount)` over `ORDER_LOCK`/`SHIPMENT_LOCK`/`EXTRA_FEE` (so voided extra fees net
+  out), `toppedUp` = the `TOP_UP` total. Backed by `credit_history (user_id_fk, created_at desc, id
+  desc)` and `(user_id_fk, org_id_fk, created_at desc, id desc)` (migration `0008`).
+- **Balance permissions** (migration `0009`, both `organization`-category group permissions):
+  `view_user_balances` reads every member's balance / ledger / summary / bills in the org;
+  `manage_user_balances` does all of that plus top-ups and top-up bill attach/remove. Neither is
+  implied by `manage_org_members` (which used to gate these routes).
+- **Org-wide ledger** (accountant view; `view_user_balances` or `manage_user_balances`, in
+  `PERMISSION_API_MAP`): `GET /organizations/:orgId/credit/ledger` (every member's entries in the org,
+  newest first, `limit`/`cursor`; each row also carries `user` — `{ id, email, displayName, code }`),
+  `GET .../credit/summary` (same shape as the per-member summary, without `userId`/`credit`) and
+  `GET .../credit/daily` (`?tz=`; per-day `{ date, spent, added, count }` — no closing balance, since
+  balances are per member). All three take `type`/`from`/`to` plus `userId` to narrow to one member
+  (`LedgerFilters.userId`, honored only here). Backed by `credit_history (org_id_fk, created_at desc,
+  id desc)` (migration `0010`).
+- **Member balances.** `GET /organizations/:orgId/credit/balances` (`view_user_balances` or
+  `manage_user_balances`, in `PERMISSION_API_MAP`; optional `from`/`to`) — `OrganizationService.listMemberBalances`, one grouped
+  query over `users_orgs` ⟕ `credit_history`. Returns `{ orgId, from, to, totals, items }`; each item is
+  `{ userId, email, displayName, code, credit, spent, toppedUp, lastActivityAt }` where `credit` is the
+  **global** wallet balance, `spent`/`toppedUp` are this org's ledger within the window (same netting as
+  the summary), and `lastActivityAt` is the latest ledger row in this org ignoring the window. `totals`
+  is `{ members, credit, spent, toppedUp, emptyBalances }` (`emptyBalances` = members with credit ≤ 0).
+  Unpaginated like `listMembers`; ordered lowest balance first.
 - **Extra fees.** Beyond the flat lock fees, staff add **ad-hoc, named fees** against an individual
   order or shipment (`ExtraFeeService`), charged to the client the same way — a `FOR UPDATE`/
   insufficient-credit (`400`)/deduct transaction that writes an `EXTRA_FEE` ledger row linked via
@@ -656,7 +698,15 @@ admin-facing `PATCH /organizations/users/:userId` (gated by `add_user`) and the 
   their credit ledger across **all** orgs (the wallet is one pool spanning orgs), newest first and
   cursor-paginated (`limit`/`cursor`, same keyset scheme as the other lists), backed by the
   `credit_history (user_id_fk, created_at desc, id desc)` index. This is the per-user read path, as
-  opposed to `OrganizationService.getMemberCredit`, which scopes the ledger to a single org.
+  opposed to `OrganizationService.getMemberCredit`, which scopes the ledger to a single org. Accepts the
+  `type`/`from`/`to`/`orgId` filters (see **Credit / billing** → **Ledger filters, refs and summary**).
+- `GET /users/me/credit/summary` — totals over the caller's ledger (same filters, no paging) for the
+  wallet's summary cards.
+- `GET /users/me/credit/daily` — the caller's ledger rolled up per calendar day in `?tz=` (IANA name,
+  default UTC; 400 if unknown), same filters, unpaginated, newest day first: `{ userId, tz, days }`, each
+  day `{ date: 'YYYY-MM-DD', spent, added, count, closingBalance }` (`spent` = money out as a positive
+  number, `added` = money in, `closingBalance` = balance after the day's last entry in the slice).
+  Backed by `summarizeLedgerByDay` in `src/common/credit-ledger.util.ts`.
 
 `UserModule` adds no new entities or tables — it reads/writes existing `users` columns and reads
 `credit_history` and `users_orgs`. Its two schema/seed changes — the new seeded `manage_all_users`
@@ -704,7 +754,7 @@ them into `init.sql` when it is next brought up to date, per **Environment / run
   unlisted routes as public and passes through; `JwtAccessGuard` then enforces auth and sets `req.user`.
 - **Admin-only / bespoke** (no dedicated guard level exists) — do it authenticated-only (as above) and
   enforce the rule in the service from the acting user, e.g. the org-fee routes check `is_admin` and
-  `GET .../members/:userId/credit` allows self / admin / `manage_org_members`.
+  `GET .../members/:userId/credit` allows self / admin / `view_user_balances` / `manage_user_balances`.
 - **Public** — leave it out of the map with no route guard.
 
 ### Auth endpoints (`AuthController`, prefix `auth`)

@@ -18,6 +18,7 @@ import { MAX_UPLOAD_BYTES, readSingleUploadedFile } from '../common/uploaded-fil
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { AuthenticatedUser } from '../auth/interfaces/jwt-payload.interface';
 import { OrganizationService } from './organization.service';
+import { parseLedgerFilters, parseTimeZone } from '../common/credit-ledger.util';
 import { CreateOrganizationDto } from './dto/create-organization.dto';
 import { UpdateOrganizationDto } from './dto/update-organization.dto';
 import { AddMemberDto } from './dto/add-member.dto';
@@ -29,6 +30,7 @@ import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { SetOrgFeeDto } from './dto/set-org-fee.dto';
 import { TopUpCreditDto } from './dto/top-up-credit.dto';
+import { AdjustCreditDto } from './dto/adjust-credit.dto';
 import { CreateCreditGroupDto } from './dto/create-credit-group.dto';
 import { UpdateCreditGroupDto } from './dto/update-credit-group.dto';
 import { SetCreditGroupFeeDto } from './dto/set-credit-group-fee.dto';
@@ -234,9 +236,14 @@ export class OrganizationController {
     return this.orgService.addMember(orgId, dto.userId);
   }
 
+  // Members with their groups. Each `user` carries safe columns only; `credit` is
+  // included only for view_user_balances / manage_user_balances holders.
   @Get(':orgId/members')
-  listMembers(@Param('orgId', ParseUUIDPipe) orgId: string) {
-    return this.orgService.listMembers(orgId);
+  listMembers(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+  ) {
+    return this.orgService.listMembers(actor.userId, orgId);
   }
 
   @Delete(':orgId/members/:userId')
@@ -255,7 +262,7 @@ export class OrganizationController {
     return this.orgService.getUserPermissions(orgId, userId);
   }
 
-  // Top up a member's credit (gated by manage_org_members — see PERMISSION_API_MAP).
+  // Top up a member's credit (gated by manage_user_balances — see PERMISSION_API_MAP).
   @Post(':orgId/members/:userId/credit')
   topUpCredit(
     @CurrentUser() actor: AuthenticatedUser,
@@ -266,8 +273,84 @@ export class OrganizationController {
     return this.orgService.topUpCredit(actor.userId, orgId, userId, dto);
   }
 
+  // The org's whole credit ledger (every member's entries in this org), newest
+  // first, cursor-paginated. Optional ?type= / ?from= / ?to= / ?userId= filters.
+  // Gated by view_user_balances or manage_user_balances (see PERMISSION_API_MAP).
+  @Get(':orgId/credit/ledger')
+  listOrgLedger(
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Query('limit') limit?: string,
+    @Query('cursor') cursor?: string,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('userId', new ParseUUIDPipe({ optional: true })) userId?: string,
+  ) {
+    const filters = parseLedgerFilters({ type, from, to, userId });
+    return this.orgService.listOrgLedger(orgId, filters, limit, cursor);
+  }
+
+  // Totals over the org's whole ledger, same filters (no paging).
+  @Get(':orgId/credit/summary')
+  getOrgCreditSummary(
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('userId', new ParseUUIDPipe({ optional: true })) userId?: string,
+  ) {
+    return this.orgService.getOrgCreditSummary(
+      orgId,
+      parseLedgerFilters({ type, from, to, userId }),
+    );
+  }
+
+  // The org's whole ledger rolled up per calendar day in ?tz= (IANA, default UTC),
+  // same filters (no paging).
+  @Get(':orgId/credit/daily')
+  getOrgCreditDaily(
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+    @Query('userId', new ParseUUIDPipe({ optional: true })) userId?: string,
+    @Query('tz') tz?: string,
+  ) {
+    return this.orgService.getOrgCreditDaily(
+      orgId,
+      parseLedgerFilters({ type, from, to, userId }),
+      parseTimeZone(tz),
+    );
+  }
+
+  // Manually correct a member's credit by a signed amount with a required note
+  // (ADJUSTMENT ledger row). Gated by manage_user_balances (see PERMISSION_API_MAP).
+  @Post(':orgId/members/:userId/credit/adjustments')
+  adjustCredit(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Body() dto: AdjustCreditDto,
+  ) {
+    return this.orgService.adjustCredit(actor.userId, orgId, userId, dto);
+  }
+
+  // Every member's wallet balance plus their spend / top-ups in this org (optional
+  // ?from= / ?to= window) and org-wide totals. Gated by view_user_balances or
+  // manage_user_balances (see PERMISSION_API_MAP).
+  @Get(':orgId/credit/balances')
+  listMemberBalances(
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.orgService.listMemberBalances(orgId, parseLedgerFilters({ from, to }));
+  }
+
   // Read a member's credit balance + ledger. Authenticated-only; the service
-  // authorizes (self, admin, or a manage_org_members holder). Cursor-paginated.
+  // authorizes (self, admin, or a view_user_balances / manage_user_balances holder).
+  // Cursor-paginated.
+  // Optional filters: ?type= (comma-separated entry types), ?from= / ?to= (to exclusive).
   @Get(':orgId/members/:userId/credit')
   @UseGuards(JwtAccessGuard)
   getMemberCredit(
@@ -276,13 +359,37 @@ export class OrganizationController {
     @Param('userId', ParseUUIDPipe) userId: string,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
   ) {
-    return this.orgService.getMemberCredit(actor.userId, orgId, userId, limit, cursor);
+    const filters = parseLedgerFilters({ type, from, to });
+    return this.orgService.getMemberCredit(actor.userId, orgId, userId, filters, limit, cursor);
+  }
+
+  // Summary totals over a member's ledger in this org (same auth as the ledger
+  // read), with the same optional type/from/to filters.
+  @Get(':orgId/members/:userId/credit/summary')
+  @UseGuards(JwtAccessGuard)
+  getMemberCreditSummary(
+    @CurrentUser() actor: AuthenticatedUser,
+    @Param('orgId', ParseUUIDPipe) orgId: string,
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Query('type') type?: string,
+    @Query('from') from?: string,
+    @Query('to') to?: string,
+  ) {
+    return this.orgService.getMemberCreditSummary(
+      actor.userId,
+      orgId,
+      userId,
+      parseLedgerFilters({ type, from, to }),
+    );
   }
 
   // Attach or replace the bill (receipt image) on a top-up. multipart/form-data,
   // one file field. Only the image changes — the top-up info stays immutable.
-  // Gated by manage_org_members (see PERMISSION_API_MAP). Covers both "attach at
+  // Gated by manage_user_balances (see PERMISSION_API_MAP). Covers both "attach at
   // top-up" (call POST .../credit, then this with the returned entryId) and later.
   @Put(':orgId/members/:userId/credit/:entryId/bill')
   async setTopUpBill(
@@ -300,7 +407,7 @@ export class OrganizationController {
   }
 
   // Presigned URL for a top-up's bill — the browser loads it directly from the bucket
-  // (no bytes through the API). Authenticated-only; service authorizes self/admin/manager.
+  // (no bytes through the API). Authenticated-only; service authorizes self/admin/balance viewer.
   // ?download=true forces a save dialog instead of inline rendering.
   @Get(':orgId/members/:userId/credit/:entryId/bill')
   @UseGuards(JwtAccessGuard)
@@ -320,7 +427,7 @@ export class OrganizationController {
     );
   }
 
-  // Remove a top-up's bill (deletes the stored object). Gated by manage_org_members.
+  // Remove a top-up's bill (deletes the stored object). Gated by manage_user_balances.
   @Delete(':orgId/members/:userId/credit/:entryId/bill')
   deleteTopUpBill(
     @CurrentUser() actor: AuthenticatedUser,
