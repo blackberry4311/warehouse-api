@@ -98,7 +98,7 @@ class-validator decorators and unknown properties are rejected.
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
   `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, `InventoryModule`,
-  `ExtraFeeModule`, and `UserModule`.
+  `ExtraFeeModule`, `UserModule`, `ActivityModule`, and `NotificationModule`.
 - `AuthModule` — registration/login/refresh/logout. Uses `@nestjs/jwt`, `bcrypt` for password
   hashing, and two Passport JWT strategies:
   - `jwt-access` (Bearer header) — guards ordinary endpoints via `JwtAccessGuard`.
@@ -592,7 +592,11 @@ endpoint); there is no separate module.
 - **Balance permissions** (migration `0009`, both `organization`-category group permissions):
   `view_user_balances` reads every member's balance / ledger / summary / bills in the org;
   `manage_user_balances` does all of that plus top-ups and top-up bill attach/remove. Neither is
-  implied by `manage_org_members` (which used to gate these routes).
+  implied by `manage_org_members` (which used to gate these routes). Since the global guard only proves a
+  permission is held in *some* org, `OrganizationService` re-checks per org: the org-wide reads
+  (`credit/balances`, `/ledger`, `/summary`, `/daily`) call `assertCanViewBalances` and the writes
+  (top-up, adjustment, bill attach/remove) call `assertCanManageBalances` — membership **and** the
+  permission held **in that org** (403 otherwise; admins pass).
 - **Org-wide ledger** (accountant view; `view_user_balances` or `manage_user_balances`, in
   `PERMISSION_API_MAP`): `GET /organizations/:orgId/credit/ledger` (every member's entries in the org,
   newest first, `limit`/`cursor`; each row also carries `user` — `{ id, email, displayName, code }`),
@@ -668,6 +672,78 @@ endpoint); there is no separate module.
   daily `@Cron` in `CreditBillCleanupService`) deletes `credit_resources` rows older than the TTL and
   their bucket objects. (A cron is used because Railway Buckets' native S3 lifecycle-rule support isn't
   documented; if confirmed, it can be replaced by a bucket lifecycle rule.)
+
+### Activity log (`wh.activity_log`, `ActivityLog` entity)
+A system-wide, append-only **activity feed** — one row per user action — for a page that logs
+everything happening in an org's orders, shipments and balances. It sits **alongside** the per-entity
+histories (`order_history` / `shipment_history` / `credit_history`), which keep the detailed diffs;
+an activity row is a lighter, display-ready headline. Columns: `org_id_fk`, `actor_id_fk` (who did it),
+`subject_user_id_fk` (who it's about — the order/shipment client, or the member whose credit changed),
+`entity_type` (`CHECK`: `ORDER` | `SHIPMENT` | `CREDIT`) + `entity_id` (polymorphic, no FK), `action`
+(`ActivityAction`, deliberately **not** `CHECK`-constrained so new actions need no migration), a small
+`summary` **`jsonb`** (always the order/shipment number where relevant, plus a note if one was given),
+and `created_at` (`timestamp(3)`). Indexed `(org_id_fk, created_at desc, id desc)` and
+`(actor_id_fk, created_at desc, id desc)` (migration `0011`).
+
+It is written by `recordActivity(em, …)` (`src/common/activity-log.util.ts`) **inside the same
+transaction** as the change — never via an after-commit event — so an action can't commit without its
+row. `OrderService` / `ShipmentService` wrap it in a private `logActivity` called next to each
+`writeHistory`. **Scope:** every order/shipment change (header, lines, status, lock, fees, labels) plus
+every balance movement — deliberately **not** org/member/group/permission admin changes. Balance
+movements are logged where they happen: the lock charge on `ORDER_LOCKED` / `SHIPMENT_LOCKED` (`fee`,
+plus `prevBalance`/`newBalance` when charged), extra fees as `*_FEE_ADDED` / `*_FEE_VOIDED` against the
+order/shipment (`ExtraFeeService.logFeeActivity`, signed `amount` + balances), the owner's markup as
+`CREDIT_COMMISSION` (inside `creditCommission`, subject = the owner), and `CREDIT_TOPPED_UP` /
+`CREDIT_ADJUSTED` (`OrganizationService.applyMemberCreditChange`). Moving an order to `IN_WAREHOUSE`
+logs **one** `ORDER_STATUS_CHANGED` row with an `autoReceived` count rather than one row per
+auto-received line. Cron cleanups (label/bill expiry) and top-up bill attach/remove are not logged.
+When adding a new order/shipment/balance mutation, call `recordActivity` in its transaction.
+Migration `0013` is a one-off, idempotent **backfill** from `order_history` / `shipment_history` /
+`credit_history` / `shipment_labels` into the same shapes (activity id = source row id; skips anything
+the live code already logged). Backfilled top-ups/adjustments have a NULL actor — the ledger never
+recorded who made them.
+
+**Read endpoint** (`ActivityModule`, `src/activity/`; `ActivityController`, prefix `activity`):
+`GET /activity?orgId=:orgId` (`view_activity_log`, an `organization`-category permission seeded by
+migration `0012`) — the org's feed, newest first, keyset-paginated (`limit`/`cursor`, same scheme as the
+other lists). Optional filters: `action` (comma-separated, unknown values dropped), `entityType` (400 if
+unknown) + `entityId` (one order/shipment/credit entry), `actorId` (who did it), `subjectUserId` (whose
+order/shipment/balance it was — backed by `activity_log_subject_created_idx`), `from` (inclusive) / `to`
+(exclusive). Each row joins `actor` / `subjectUser` (safe columns only). `ActivityService` re-checks
+org membership **and** that `view_activity_log` is held **in that org** (403 otherwise; admins pass),
+so a grant in one org can't read another's feed. Standalone module over `forFeature([ActivityLog])`,
+importing `OrganizationModule` for `OrganizationService`.
+
+### Notifications (`NotificationModule`, `src/notification/`; `NotificationController`, prefix `notifications`)
+In-app only (no email/push yet), single-instance. Fanned out from `activity_log`:
+- **Emit after commit.** `ActivityLogSubscriber` (`src/activity/`, a TypeORM subscriber registered on the
+  `DataSource`) buffers `ActivityLog` inserts on the transaction's `QueryRunner.data` and, once the
+  **outermost** transaction commits, emits `activity.recorded` (`ACTIVITY_RECORDED`,
+  `src/activity/activity.events.ts`) via `@nestjs/event-emitter` (`EventEmitterModule.forRoot()` in
+  `AppModule`). Rolled-back actions emit nothing; no feature code calls `emit` — `recordActivity` is enough.
+- **Fan-out.** `NotificationListener` (`@OnEvent`, async) → `NotificationService.notifyActivities`. Each
+  activity is delivered in its own transaction that first **claims** it (`UPDATE activity_log SET
+  notified_at = now() WHERE id = … AND notified_at IS NULL`), then inserts one `notifications` row per
+  recipient (`orIgnore` on the unique `(recipient_id_fk, activity_id_fk)`), so it is idempotent.
+- **Recipients** (`resolveRecipients`), never the actor: the activity's `subject_user_id_fk` (the client, or
+  the credit-group owner on `CREDIT_COMMISSION`), plus staff by the `STAFF_RECIPIENTS` map — holders **in
+  that org** (via groups; system admins are not included) of `review_order` on `ORDER_PLACED`,
+  `review_shipment` on `SHIPMENT_PLACED`, `process_order` on `ORDER_LOCKED`, `process_shipment` on
+  `SHIPMENT_LOCKED`. Extend the map to notify more roles.
+- **Sweep.** The same listener runs an every-minute `@Cron` (`sweepPending`) over `activity_log` rows still
+  `notified_at IS NULL` older than 30 s (batch 200), covering events lost to a crash/thrown listener.
+  Migration `0014` stamps every pre-existing row (incl. the `0013` backfill) as notified so history is
+  never re-announced.
+- **Endpoints** (authenticated-only: `@UseGuards(JwtAccessGuard)`, not in `PERMISSION_API_MAP`, always the
+  caller's own): `GET /notifications` (`?orgId=`, `?unread=true`, keyset `limit`/`cursor`; each item is
+  `{ id, readAt, createdAt, activity: { id, orgId, action, entityType, entityId, summary, createdAt,
+  actor } }`), `GET /notifications/unread-count` (`?orgId=`), `POST /notifications/read-all` (`?orgId=`),
+  `POST /notifications/:notificationId/read` (404 if not the caller's).
+- **Tables** (migration `0014`): `activity_log.notified_at` (+ partial index on the pending tail) and
+  `Notification` → `notifications` (`recipient_id_fk`, `activity_id_fk`, both `on delete cascade`,
+  `read_at`, `created_at` `timestamp(3)`), indexed for the inbox keyset and the unread count.
+- Multi-instance note: the fan-out is DB-backed so it stays correct with replicas; only a future live push
+  (SSE/websocket) would need cross-instance pub/sub.
 
 ### User endpoints (`UserController`, prefix `users`)
 Mostly self-service for the **authenticated caller**, scoped to `/me` — every `/me` action targets the
@@ -769,7 +845,7 @@ source of truth. Registered TypeORM entities (all in `src/entities/`): `User`, `
 `Organization`, `UserOrg`, `OrgGroup`, `Permission`, `UserGroup`, `GroupPermission`, `Order`,
 `OrderDetail`, `OrderHistory`, `OrderSequence`, `OrgFee`, `CreditHistory`, `CreditResource`,
 `Shipment`, `ShipmentDetail`, `ShipmentHistory`, `ShipmentLabel`, `ShipmentSequence`, `TotalFee`,
-`CreditGroup`, `CreditGroupFee`, `CreditGroupMember`.
+`CreditGroup`, `CreditGroupFee`, `CreditGroupMember`, `ActivityLog`, `Notification`.
 
 **RBAC / multi-tenancy tables** (entity ↔ table):
 - `Organization` → `organizations` — top-level tenant.

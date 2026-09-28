@@ -278,6 +278,7 @@ export class OrganizationController {
   // Gated by view_user_balances or manage_user_balances (see PERMISSION_API_MAP).
   @Get(':orgId/credit/ledger')
   listOrgLedger(
+    @CurrentUser() actor: AuthenticatedUser,
     @Param('orgId', ParseUUIDPipe) orgId: string,
     @Query('limit') limit?: string,
     @Query('cursor') cursor?: string,
@@ -287,12 +288,13 @@ export class OrganizationController {
     @Query('userId', new ParseUUIDPipe({ optional: true })) userId?: string,
   ) {
     const filters = parseLedgerFilters({ type, from, to, userId });
-    return this.orgService.listOrgLedger(orgId, filters, limit, cursor);
+    return this.orgService.listOrgLedger(actor.userId, orgId, filters, limit, cursor);
   }
 
   // Totals over the org's whole ledger, same filters (no paging).
   @Get(':orgId/credit/summary')
   getOrgCreditSummary(
+    @CurrentUser() actor: AuthenticatedUser,
     @Param('orgId', ParseUUIDPipe) orgId: string,
     @Query('type') type?: string,
     @Query('from') from?: string,
@@ -300,6 +302,7 @@ export class OrganizationController {
     @Query('userId', new ParseUUIDPipe({ optional: true })) userId?: string,
   ) {
     return this.orgService.getOrgCreditSummary(
+      actor.userId,
       orgId,
       parseLedgerFilters({ type, from, to, userId }),
     );
@@ -309,6 +312,7 @@ export class OrganizationController {
   // same filters (no paging).
   @Get(':orgId/credit/daily')
   getOrgCreditDaily(
+    @CurrentUser() actor: AuthenticatedUser,
     @Param('orgId', ParseUUIDPipe) orgId: string,
     @Query('type') type?: string,
     @Query('from') from?: string,
@@ -317,6 +321,7 @@ export class OrganizationController {
     @Query('tz') tz?: string,
   ) {
     return this.orgService.getOrgCreditDaily(
+      actor.userId,
       orgId,
       parseLedgerFilters({ type, from, to, userId }),
       parseTimeZone(tz),
@@ -340,11 +345,16 @@ export class OrganizationController {
   // manage_user_balances (see PERMISSION_API_MAP).
   @Get(':orgId/credit/balances')
   listMemberBalances(
+    @CurrentUser() actor: AuthenticatedUser,
     @Param('orgId', ParseUUIDPipe) orgId: string,
     @Query('from') from?: string,
     @Query('to') to?: string,
   ) {
-    return this.orgService.listMemberBalances(orgId, parseLedgerFilters({ from, to }));
+    return this.orgService.listMemberBalances(
+      actor.userId,
+      orgId,
+      parseLedgerFilters({ from, to }),
+    );
   }
 
   // Read a member's credit balance + ledger. Authenticated-only; the service

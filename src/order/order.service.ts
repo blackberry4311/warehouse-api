@@ -29,6 +29,12 @@ import { UpdateOrderDetailStatusDto } from './dto/update-order-detail-status.dto
 import { LockOrderDto } from './dto/lock-order.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
 import { creditCommission, resolveClientFee } from '../common/credit-group.util';
+import { recordActivity } from '../common/activity-log.util';
+import {
+  ActivityAction,
+  ActivityEntityType,
+  ActivitySummary,
+} from '../entities/activity-log.entity';
 
 /**
  * Status moves the **client** (order owner) may make while the order is still
@@ -159,6 +165,27 @@ export class OrderService {
     );
   }
 
+  /** Append an `activity_log` row for an action on `order` (see {@link recordActivity}).
+   * The order number and action note are always included in the summary. */
+  private async logActivity(
+    em: EntityManager,
+    order: Order,
+    actorId: string,
+    action: ActivityAction,
+    summary: ActivitySummary = {},
+    note: string | null = null,
+  ): Promise<void> {
+    await recordActivity(em, {
+      orgId: order.orgId,
+      actorId,
+      subjectUserId: order.userId,
+      entityType: ActivityEntityType.ORDER,
+      entityId: order.id,
+      action,
+      summary: { orderNumber: order.orderNumber, ...summary, ...(note ? { note } : {}) },
+    });
+  }
+
   /** Build the `changes.item` entry for a line: its id + name snapshot, plus any
    * per-field diffs. */
   private itemChange(detail: OrderDetail, fields?: Record<string, FieldDiff>): OrderItemChange {
@@ -258,6 +285,14 @@ export class OrderService {
         userId,
         OrderChangeType.CREATED,
         changes,
+        dto.note ?? null,
+      );
+      await this.logActivity(
+        em,
+        order,
+        userId,
+        ActivityAction.ORDER_PLACED,
+        { lineCount: details.length, totalQty: details.reduce((sum, d) => sum + d.qty, 0) },
         dto.note ?? null,
       );
 
@@ -445,6 +480,9 @@ export class OrderService {
       order.tracking = dto.tracking;
       const saved = await em.save(order);
       await this.writeHistory(em, order.id, userId, OrderChangeType.ORDER_UPDATED, changes, null);
+      await this.logActivity(em, order, userId, ActivityAction.ORDER_UPDATED, {
+        fields: changes.order,
+      });
       return saved;
     });
   }
@@ -479,6 +517,9 @@ export class OrderService {
       };
       // The line's own `note` is data (captured in `changes`), not an action note.
       await this.writeHistory(em, order.id, userId, OrderChangeType.ITEM_ADDED, changes, null);
+      await this.logActivity(em, order, userId, ActivityAction.ORDER_ITEM_ADDED, {
+        item: changes.item,
+      });
       return detail;
     });
   }
@@ -529,6 +570,9 @@ export class OrderService {
       const saved = await em.save(detail);
       const changes: OrderChange = { item: this.itemChange(detail, fields) };
       await this.writeHistory(em, order.id, userId, OrderChangeType.ITEM_UPDATED, changes, null);
+      await this.logActivity(em, order, userId, ActivityAction.ORDER_ITEM_UPDATED, {
+        item: changes.item,
+      });
       return saved;
     });
   }
@@ -556,6 +600,9 @@ export class OrderService {
       };
       await em.remove(detail);
       await this.writeHistory(em, order.id, userId, OrderChangeType.ITEM_REMOVED, changes, null);
+      await this.logActivity(em, order, userId, ActivityAction.ORDER_ITEM_REMOVED, {
+        item: changes.item,
+      });
       return { id: detailId, removed: true };
     });
   }
@@ -608,6 +655,14 @@ export class OrderService {
         userId,
         OrderChangeType.ITEM_RECEIPT,
         changes,
+        dto.note ?? null,
+      );
+      await this.logActivity(
+        em,
+        order,
+        userId,
+        ActivityAction.ORDER_ITEM_RECEIPT,
+        { item: changes.item },
         dto.note ?? null,
       );
       return saved;
@@ -671,6 +726,8 @@ export class OrderService {
         }),
       );
 
+      // The client's balance movement, surfaced on the activity row (null when free).
+      let balance: { prevBalance: number; newBalance: number } | null = null;
       if (charged > 0) {
         // Lock the client's row so two concurrent locks can't both pass the check
         // and overdraw the balance.
@@ -687,6 +744,7 @@ export class OrderService {
         const newBalance = prevBalance - charged;
 
         await em.update(User, { id: order.userId }, { credit: newBalance });
+        balance = { prevBalance, newBalance };
 
         await em.save(
           em.create(CreditHistory, {
@@ -714,6 +772,8 @@ export class OrderService {
           orderId: order.id,
           feeId: lockFee.id,
           note: dto.note ?? null,
+          actorId: userId,
+          reference: { orderNumber: order.orderNumber },
         });
       }
 
@@ -729,6 +789,14 @@ export class OrderService {
         userId,
         OrderChangeType.LOCKED,
         changes,
+        dto.note ?? null,
+      );
+      await this.logActivity(
+        em,
+        order,
+        userId,
+        ActivityAction.ORDER_LOCKED,
+        { fee: charged, ...(balance ?? {}) },
         dto.note ?? null,
       );
 
@@ -795,6 +863,7 @@ export class OrderService {
       // afterwards via PATCH /orders/:orderId/details/:detailId/status. Lines
       // already resolved (received/not-arrived/cancelled while locked) are left
       // untouched. Each auto-receipt is recorded as its own ITEM_RECEIPT row.
+      let autoReceived = 0;
       if (dto.status === OrderStatus.IN_WAREHOUSE) {
         const pending = await em.find(OrderDetail, {
           where: { orderId: order.id, status: OrderDetailStatus.PENDING },
@@ -818,7 +887,19 @@ export class OrderService {
             null,
           );
         }
+        autoReceived = pending.length;
       }
+
+      // One feed row for the status move; auto-receipts are folded in as a count
+      // rather than logged per line (their detail is in order_history).
+      await this.logActivity(
+        em,
+        order,
+        userId,
+        ActivityAction.ORDER_STATUS_CHANGED,
+        { status: changes.order!.status, ...(autoReceived > 0 ? { autoReceived } : {}) },
+        dto.note ?? null,
+      );
 
       return saved;
     });

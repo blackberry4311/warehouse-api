@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { EntityManager, Repository } from 'typeorm';
 import { Order, OrderStatus } from '../entities/order.entity';
 import { Shipment, ShipmentStatus } from '../entities/shipment.entity';
 import { TotalFee } from '../entities/total-fee.entity';
@@ -14,6 +14,12 @@ import { User } from '../entities/user.entity';
 import { OrganizationService } from '../organization/organization.service';
 import { CreateExtraFeeDto } from './dto/create-extra-fee.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
+import { recordActivity } from '../common/activity-log.util';
+import {
+  ActivityAction,
+  ActivityEntityType,
+  ActivitySummary,
+} from '../entities/activity-log.entity';
 
 /** Order states in which no further fee may be added (matches OrderService). */
 const ORDER_TERMINAL: readonly OrderStatus[] = [OrderStatus.CANCELLED];
@@ -35,6 +41,14 @@ interface FeeTarget {
   chargeable: boolean;
   column: 'orderId' | 'shipmentId';
   perms: { review: string; process: string; place: string };
+  /** How the target is logged in the activity feed: its entity type, the fee
+   * add/void actions, and its display number (e.g. `{ orderNumber }`). */
+  activity: {
+    entityType: ActivityEntityType;
+    added: ActivityAction;
+    voided: ActivityAction;
+    reference: ActivitySummary;
+  };
 }
 
 /** What the caller may do with a target's fees (admins hold every permission). */
@@ -95,6 +109,12 @@ export class ExtraFeeService {
       chargeable: order.locked && !ORDER_TERMINAL.includes(order.status),
       column: 'orderId',
       perms: { review: 'review_order', process: 'process_order', place: 'place_order' },
+      activity: {
+        entityType: ActivityEntityType.ORDER,
+        added: ActivityAction.ORDER_FEE_ADDED,
+        voided: ActivityAction.ORDER_FEE_VOIDED,
+        reference: { orderNumber: order.orderNumber },
+      },
     };
   }
 
@@ -111,6 +131,12 @@ export class ExtraFeeService {
       chargeable: shipment.locked && shipment.status === ShipmentStatus.AWAITING,
       column: 'shipmentId',
       perms: { review: 'review_shipment', process: 'process_shipment', place: 'place_shipment' },
+      activity: {
+        entityType: ActivityEntityType.SHIPMENT,
+        added: ActivityAction.SHIPMENT_FEE_ADDED,
+        voided: ActivityAction.SHIPMENT_FEE_VOIDED,
+        reference: { shipmentNumber: shipment.shipmentNumber },
+      },
     };
   }
 
@@ -121,6 +147,34 @@ export class ExtraFeeService {
       this.orgService.hasOrgPermission(target.orgId, userId, target.perms.place),
     ]);
     return { canReview, canManage, canPlace };
+  }
+
+  /** Append the fee add/void activity row, logged against the order/shipment with
+   * the client's balance movement (`amount` is signed, as on the ledger row). */
+  private async logFeeActivity(
+    em: EntityManager,
+    actorId: string,
+    target: FeeTarget,
+    action: ActivityAction,
+    fee: TotalFee,
+    movement: { amount: number; prevBalance: number; newBalance: number; note: string | null },
+  ): Promise<void> {
+    const { note, ...balance } = movement;
+    await recordActivity(em, {
+      orgId: target.orgId,
+      actorId,
+      subjectUserId: target.clientUserId,
+      entityType: target.activity.entityType,
+      entityId: target.id,
+      action,
+      summary: {
+        ...target.activity.reference,
+        feeId: fee.id,
+        feeName: fee.name,
+        ...balance,
+        ...(note ? { note } : {}),
+      },
+    });
   }
 
   // ----- Shared operations ------------------------------------------------
@@ -186,6 +240,13 @@ export class ExtraFeeService {
           note: dto.note ?? null,
         }),
       );
+
+      await this.logFeeActivity(em, actorId, target, target.activity.added, fee, {
+        amount: -dto.amount,
+        prevBalance,
+        newBalance,
+        note: dto.note ?? null,
+      });
 
       return fee;
     });
@@ -291,6 +352,13 @@ export class ExtraFeeService {
           note: note ?? `Void of fee "${fee.name}"`,
         }),
       );
+
+      await this.logFeeActivity(em, actorId, target, target.activity.voided, fee, {
+        amount: fee.amount,
+        prevBalance,
+        newBalance,
+        note: note ?? null,
+      });
 
       return saved;
     });

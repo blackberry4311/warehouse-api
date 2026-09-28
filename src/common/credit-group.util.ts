@@ -6,6 +6,12 @@ import { CreditGroupMember } from '../entities/credit-group-member.entity';
 import { CreditEntryType, CreditHistory } from '../entities/credit-history.entity';
 import { FeeType } from '../entities/org-fee.entity';
 import { User } from '../entities/user.entity';
+import {
+  ActivityAction,
+  ActivityEntityType,
+  ActivitySummary,
+} from '../entities/activity-log.entity';
+import { recordActivity } from './activity-log.util';
 
 /**
  * The resolved lock-fee split for a client, given the org's flat fee (`base`):
@@ -68,6 +74,10 @@ export async function creditCommission(
     shipmentId?: string | null;
     feeId: string;
     note?: string | null;
+    /** Who triggered the lock (the reviewer) — the activity row's actor. */
+    actorId: string;
+    /** Display reference for the activity summary, e.g. `{ orderNumber }`. */
+    reference: ActivitySummary;
   },
 ): Promise<void> {
   const rows: Array<{ credit: string }> = await em.query(
@@ -81,7 +91,7 @@ export async function creditCommission(
 
   await em.update(User, { id: params.ownerId }, { credit: newBalance });
 
-  await em.save(
+  const entry = await em.save(
     em.create(CreditHistory, {
       userId: params.ownerId,
       orgId: params.orgId,
@@ -95,4 +105,14 @@ export async function creditCommission(
       note: params.note ?? null,
     }),
   );
+
+  await recordActivity(em, {
+    orgId: params.orgId,
+    actorId: params.actorId,
+    subjectUserId: params.ownerId,
+    entityType: ActivityEntityType.CREDIT,
+    entityId: entry.id,
+    action: ActivityAction.CREDIT_COMMISSION,
+    summary: { ...params.reference, amount: params.amount, prevBalance, newBalance },
+  });
 }

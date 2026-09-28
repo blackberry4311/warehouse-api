@@ -46,6 +46,8 @@ import {
 } from '../common/credit-ledger.util';
 import { StorageService } from '../storage/storage.service';
 import { UploadedFile } from '../common/uploaded-file.util';
+import { recordActivity } from '../common/activity-log.util';
+import { ActivityAction, ActivityEntityType } from '../entities/activity-log.entity';
 
 /**
  * Manages everything under an organization: membership, groups (roles),
@@ -743,7 +745,7 @@ export class OrganizationService {
     change: { entryType: CreditEntryType; amount: number; note: string | null },
   ) {
     await this.getOrganization(orgId);
-    await this.assertOrgMembership(orgId, actingUserId);
+    await this.assertCanManageBalances(orgId, actingUserId);
 
     const membership = await this.userOrgRepo.findOne({ where: { orgId, userId: targetUserId } });
     if (!membership) throw new NotFoundException('User is not a member of this organization');
@@ -775,6 +777,24 @@ export class OrganizationService {
           note: change.note,
         }),
       );
+
+      await recordActivity(em, {
+        orgId,
+        actorId: actingUserId,
+        subjectUserId: targetUserId,
+        entityType: ActivityEntityType.CREDIT,
+        entityId: entry.id,
+        action:
+          change.entryType === CreditEntryType.TOP_UP
+            ? ActivityAction.CREDIT_TOPPED_UP
+            : ActivityAction.CREDIT_ADJUSTED,
+        summary: {
+          amount: change.amount,
+          prevBalance,
+          newBalance,
+          ...(change.note ? { note: change.note } : {}),
+        },
+      });
 
       return { userId: targetUserId, credit: newBalance, entryId: entry.id };
     });
@@ -870,8 +890,9 @@ export class OrganizationService {
    * `totals` sums the same columns across all members. Gated by
    * `view_user_balances` or `manage_user_balances` via PERMISSION_API_MAP.
    */
-  async listMemberBalances(orgId: string, filters: LedgerFilters) {
+  async listMemberBalances(actingUserId: string, orgId: string, filters: LedgerFilters) {
     await this.getOrganization(orgId);
+    await this.assertCanViewBalances(orgId, actingUserId);
 
     const window = [
       filters.from ? 'c.createdAt >= :from' : null,
@@ -959,8 +980,15 @@ export class OrganizationService {
    * member (`user`: safe columns only) and a `hasBill` flag. Gated by
    * `view_user_balances` or `manage_user_balances` via PERMISSION_API_MAP.
    */
-  async listOrgLedger(orgId: string, filters: LedgerFilters, limitRaw?: string, cursor?: string) {
+  async listOrgLedger(
+    actingUserId: string,
+    orgId: string,
+    filters: LedgerFilters,
+    limitRaw?: string,
+    cursor?: string,
+  ) {
     await this.getOrganization(orgId);
+    await this.assertCanViewBalances(orgId, actingUserId);
 
     const limit = parseLimit(limitRaw);
     const qb = joinLedgerRefs(
@@ -993,8 +1021,9 @@ export class OrganizationService {
    * the org-wide counterpart of `getMemberCreditSummary`, same gate as
    * {@link listOrgLedger}.
    */
-  async getOrgCreditSummary(orgId: string, filters: LedgerFilters) {
+  async getOrgCreditSummary(actingUserId: string, orgId: string, filters: LedgerFilters) {
     await this.getOrganization(orgId);
+    await this.assertCanViewBalances(orgId, actingUserId);
 
     const qb = this.creditHistoryRepo.createQueryBuilder('c').where('c.orgId = :orgId', { orgId });
     applyLedgerFilters(qb, { ...filters, orgId: undefined });
@@ -1012,8 +1041,9 @@ export class OrganizationService {
    * out, money in and entry count across all members (or one via `filters.userId`).
    * No closing balance: balances are per member. Same gate as {@link listOrgLedger}.
    */
-  async getOrgCreditDaily(orgId: string, filters: LedgerFilters, tz: string) {
+  async getOrgCreditDaily(actingUserId: string, orgId: string, filters: LedgerFilters, tz: string) {
     await this.getOrganization(orgId);
+    await this.assertCanViewBalances(orgId, actingUserId);
 
     const qb = this.creditHistoryRepo.createQueryBuilder('c').where('c.orgId = :orgId', { orgId });
     applyLedgerFilters(qb, { ...filters, orgId: undefined });
@@ -1069,7 +1099,7 @@ export class OrganizationService {
     file: UploadedFile,
   ) {
     await this.getOrganization(orgId);
-    await this.assertOrgMembership(orgId, actingUserId);
+    await this.assertCanManageBalances(orgId, actingUserId);
     const entry = await this.loadTopUpEntry(orgId, targetUserId, entryId);
 
     const existing = await this.creditResourceRepo.findOne({ where: { creditId: entry.id } });
@@ -1154,7 +1184,7 @@ export class OrganizationService {
     entryId: string,
   ) {
     await this.getOrganization(orgId);
-    await this.assertOrgMembership(orgId, actingUserId);
+    await this.assertCanManageBalances(orgId, actingUserId);
     const entry = await this.loadTopUpEntry(orgId, targetUserId, entryId);
 
     const resource = await this.creditResourceRepo.findOne({ where: { creditId: entry.id } });
@@ -1219,6 +1249,27 @@ export class OrganizationService {
    * admins always do. Used for row-level scoping (e.g. `process_order` staff see
    * every order in the org, while a plain `place_order` client sees only theirs).
    */
+  /**
+   * Gate for the org-wide balance reads (balances / ledger / summary / daily). The
+   * global guard only proves the caller holds a balance permission in *some* org;
+   * this proves they belong to **this** org and hold it **here** (admins pass).
+   */
+  private async assertCanViewBalances(orgId: string, userId: string): Promise<void> {
+    await this.assertOrgMembership(orgId, userId);
+    if (!(await this.canViewBalances(orgId, userId))) {
+      throw new ForbiddenException("You cannot view this organization's balances");
+    }
+  }
+
+  /** Gate for balance writes (top-ups, adjustments, bills): `manage_user_balances`
+   * held in **this** org, not just anywhere (admins pass). */
+  private async assertCanManageBalances(orgId: string, userId: string): Promise<void> {
+    await this.assertOrgMembership(orgId, userId);
+    if (!(await this.hasOrgPermission(orgId, userId, 'manage_user_balances'))) {
+      throw new ForbiddenException("You cannot manage this organization's balances");
+    }
+  }
+
   /** Whether the user may read other members' balances in the org (either balance permission). */
   private async canViewBalances(orgId: string, userId: string): Promise<boolean> {
     return (

@@ -32,6 +32,12 @@ import { UpdateShipmentStatusDto } from './dto/update-shipment-status.dto';
 import { ShipmentItemDto } from './dto/shipment-item.dto';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
 import { creditCommission, resolveClientFee } from '../common/credit-group.util';
+import { recordActivity } from '../common/activity-log.util';
+import {
+  ActivityAction,
+  ActivityEntityType,
+  ActivitySummary,
+} from '../entities/activity-log.entity';
 
 /** Status moves the **client** (owner) may make while the shipment is unlocked. */
 const CLIENT_SHIPMENT_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
@@ -167,6 +173,14 @@ export class ShipmentService {
         changes,
         dto.note ?? null,
       );
+      await this.logActivity(
+        em,
+        shipment,
+        userId,
+        ActivityAction.SHIPMENT_PLACED,
+        { lineCount: items.length, totalQty: items.reduce((sum, i) => sum + i.qty, 0) },
+        dto.note ?? null,
+      );
 
       shipment.items = items;
       return shipment;
@@ -237,6 +251,31 @@ export class ShipmentService {
     await em.save(
       em.create(ShipmentHistory, { shipmentId, changedBy: actorId, changeType, changes, note }),
     );
+  }
+
+  /** Append an `activity_log` row for an action on `shipment` (see {@link recordActivity}).
+   * The shipment number and action note are always included in the summary. */
+  private async logActivity(
+    em: EntityManager,
+    shipment: Shipment,
+    actorId: string,
+    action: ActivityAction,
+    summary: ActivitySummary = {},
+    note: string | null = null,
+  ): Promise<void> {
+    await recordActivity(em, {
+      orgId: shipment.orgId,
+      actorId,
+      subjectUserId: shipment.userId,
+      entityType: ActivityEntityType.SHIPMENT,
+      entityId: shipment.id,
+      action,
+      summary: {
+        shipmentNumber: shipment.shipmentNumber,
+        ...summary,
+        ...(note ? { note } : {}),
+      },
+    });
   }
 
   /**
@@ -510,6 +549,14 @@ export class ShipmentService {
           changes,
           dto.note ?? null,
         );
+        await this.logActivity(
+          em,
+          shipment,
+          userId,
+          ActivityAction.SHIPMENT_ITEMS_CHANGED,
+          { items: changedItems },
+          dto.note ?? null,
+        );
       }
     });
 
@@ -569,6 +616,8 @@ export class ShipmentService {
         }),
       );
 
+      // The client's balance movement, surfaced on the activity row (null when free).
+      let balance: { prevBalance: number; newBalance: number } | null = null;
       if (charged > 0) {
         const rows: Array<{ credit: string }> = await em.query(
           `SELECT credit FROM wh.users WHERE id = $1 FOR UPDATE`,
@@ -583,6 +632,7 @@ export class ShipmentService {
         const newBalance = prevBalance - charged;
 
         await em.update(User, { id: shipment.userId }, { credit: newBalance });
+        balance = { prevBalance, newBalance };
 
         await em.save(
           em.create(CreditHistory, {
@@ -610,6 +660,8 @@ export class ShipmentService {
           shipmentId: shipment.id,
           feeId: lockFee.id,
           note: dto.note ?? null,
+          actorId: userId,
+          reference: { shipmentNumber: shipment.shipmentNumber },
         });
       }
 
@@ -653,6 +705,14 @@ export class ShipmentService {
         userId,
         ShipmentChangeType.LOCKED,
         changes,
+        dto.note ?? null,
+      );
+      await this.logActivity(
+        em,
+        shipment,
+        userId,
+        ActivityAction.SHIPMENT_LOCKED,
+        { fee: charged, ...(balance ?? {}) },
         dto.note ?? null,
       );
     });
@@ -717,6 +777,14 @@ export class ShipmentService {
         changes,
         dto.note ?? null,
       );
+      await this.logActivity(
+        em,
+        shipment,
+        userId,
+        ActivityAction.SHIPMENT_STATUS_CHANGED,
+        { status: changes.shipment!.status },
+        dto.note ?? null,
+      );
     });
 
     return this.getShipment(userId, shipment.id);
@@ -767,7 +835,13 @@ export class ShipmentService {
       contentType: file.mimetype,
       size: file.size,
     });
-    const saved = await this.labelRepo.save(label);
+    const saved = await this.labelRepo.manager.transaction(async (em) => {
+      const row = await em.save(label);
+      await this.logActivity(em, shipment, userId, ActivityAction.SHIPMENT_LABEL_SET, {
+        replaced: !!existing,
+      });
+      return row;
+    });
 
     // Best-effort: drop the old object only after the new key is safely committed, so
     // a failed delete can never leave the row pointing at nothing.
@@ -818,7 +892,10 @@ export class ShipmentService {
     const label = await this.labelRepo.findOne({ where: { shipmentId: shipment.id } });
     if (!label) throw new NotFoundException('This shipment has no label attached');
 
-    await this.labelRepo.delete({ id: label.id });
+    await this.labelRepo.manager.transaction(async (em) => {
+      await em.delete(ShipmentLabel, { id: label.id });
+      await this.logActivity(em, shipment, userId, ActivityAction.SHIPMENT_LABEL_REMOVED);
+    });
     await this.storage.delete(label.objectKey);
     return { shipmentId: shipment.id, hasLabel: false };
   }

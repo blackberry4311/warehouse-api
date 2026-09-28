@@ -60,6 +60,10 @@ export const PERMISSION_API_MAP: Record<string, string[]> = {
   ],
   view_user_permissions: ['get /organizations/:orgId/members/:userId/permissions'],
 
+  // Activity log: the org-wide feed of every order / shipment change and balance
+  // movement. ActivityService re-checks the permission is held in *that* org.
+  view_activity_log: ['get /activity'],
+
   // Groups
   manage_groups: [
     'post /organizations/:orgId/groups',

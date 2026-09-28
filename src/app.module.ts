@@ -27,6 +27,8 @@ import { TotalFee } from './entities/total-fee.entity';
 import { CreditGroup } from './entities/credit-group.entity';
 import { CreditGroupFee } from './entities/credit-group-fee.entity';
 import { CreditGroupMember } from './entities/credit-group-member.entity';
+import { ActivityLog } from './entities/activity-log.entity';
+import { Notification } from './entities/notification.entity';
 import { AuthModule } from './auth/auth.module';
 import { OrganizationModule } from './organization/organization.module';
 import { RbacModule } from './rbac/rbac.module';
@@ -35,13 +37,17 @@ import { ShipmentModule } from './shipment/shipment.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { ExtraFeeModule } from './extra-fee/extra-fee.module';
 import { UserModule } from './user/user.module';
+import { ActivityModule } from './activity/activity.module';
+import { NotificationModule } from './notification/notification.module';
 import { StorageModule } from './storage/storage.module';
 import { ScheduleModule } from '@nestjs/schedule';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     ScheduleModule.forRoot(),
+    EventEmitterModule.forRoot(),
     StorageModule,
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
@@ -74,6 +80,8 @@ import { ScheduleModule } from '@nestjs/schedule';
           CreditGroup,
           CreditGroupFee,
           CreditGroupMember,
+          ActivityLog,
+          Notification,
         ],
         synchronize: false,
       }),
@@ -87,6 +95,8 @@ import { ScheduleModule } from '@nestjs/schedule';
     InventoryModule,
     ExtraFeeModule,
     UserModule,
+    ActivityModule,
+    NotificationModule,
   ],
   exports: [TypeOrmModule],
   controllers: [AppController],

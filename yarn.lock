@@ -1408,6 +1408,13 @@
     path-to-regexp "8.4.2"
     tslib "2.8.1"
 
+"@nestjs/event-emitter@^12.0.1":
+  version "12.0.1"
+  resolved "https://registry.yarnpkg.com/@nestjs/event-emitter/-/event-emitter-12.0.1.tgz#d58662acd922762047b859cf67f7f70b456fd063"
+  integrity sha512-7MbpgNcxUcDlqcYY/qgZm1H7MfK3uGcRsd8lEjj9ZYvI9qTl6kdkkykpxZ6YjBRH3wlZK5dFLAei8h5qpsHzOw==
+  dependencies:
+    eventemitter2 "6.4.9"
+
 "@nestjs/jwt@^12.0.1":
   version "12.0.1"
   resolved "https://registry.yarnpkg.com/@nestjs/jwt/-/jwt-12.0.1.tgz#964d71aa3ef765801bcfd0bc06a7742c9f19f2bd"
@@ -3374,6 +3381,11 @@ esutils@^2.0.2:
   version "2.0.3"
   resolved "https://registry.yarnpkg.com/esutils/-/esutils-2.0.3.tgz#74d2eb4de0b8da1293711910d50775b9b710ef64"
   integrity sha512-kVscqXk4OCp68SZ0dkgEKVi6/8ij300KBWTJq32P/dYeWTSwK41WyTxalN1eRmA5Z9UU/LX9D7FWSmV9SAYx6g==
+
+eventemitter2@6.4.9:
+  version "6.4.9"
+  resolved "https://registry.yarnpkg.com/eventemitter2/-/eventemitter2-6.4.9.tgz#41f2750781b4230ed58827bc119d293471ecb125"
+  integrity sha512-JEPTiaOt9f04oa6NOkc4aH+nVp5I3wEjpHbIPqfgCdD5v5bUzy7xQqwcVO2aDQgOWhI28da57HksMrzK9HlRxg==
 
 events-universal@^1.0.0:
   version "1.0.1"
