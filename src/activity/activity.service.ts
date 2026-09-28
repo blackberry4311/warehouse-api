@@ -1,6 +1,6 @@
-import { BadRequestException, ForbiddenException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Brackets, Repository } from 'typeorm';
 import { ActivityAction, ActivityEntityType, ActivityLog } from '../entities/activity-log.entity';
 import { OrganizationService } from '../organization/organization.service';
 import { decodeCursor, Page, parseLimit, toPage } from '../common/pagination.util';
@@ -85,24 +85,27 @@ export class ActivityService {
   ) {}
 
   /**
-   * List an org's activity, newest first, keyset-paginated by (created_at, id). The
-   * route is gated by `view_activity_log` in `PERMISSION_API_MAP`; here we re-check
-   * that the caller belongs to **this** org and holds the permission **in it**
-   * (admins pass both), so a grant in one org can't read another's feed. Each row
-   * joins `actor` / `subjectUser` with safe columns only.
+   * List activity, newest first, keyset-paginated by (created_at, id).
+   * Authenticated-only (not in `PERMISSION_API_MAP`); the scoping is applied here:
+   * - everyone sees the rows they acted on or are the subject of, in any org;
+   * - a `view_all_activity_log` holder additionally sees every row in each org where
+   *   they hold that permission (a grant in one org never exposes another's feed);
+   * - a system admin sees everything.
+   * `orgId` optionally narrows to one org. Each row joins `actor` / `subjectUser`
+   * with safe columns only.
    */
   async listActivity(
     userId: string,
-    orgId: string,
+    orgId: string | undefined,
     filters: ActivityFilters,
     limitRaw?: string,
     cursor?: string,
   ): Promise<Page<ActivityLog>> {
-    await this.orgService.getOrganization(orgId);
-    await this.orgService.assertOrgMembership(orgId, userId);
-    if (!(await this.orgService.hasOrgPermission(orgId, userId, 'view_activity_log'))) {
-      throw new ForbiddenException('You cannot view the activity log of this organization');
-    }
+    if (orgId) await this.orgService.getOrganization(orgId);
+    const viewAllOrgIds = await this.orgService.getOrgIdsWithPermission(
+      userId,
+      'view_all_activity_log',
+    );
 
     const limit = parseLimit(limitRaw);
     const qb = this.activityRepo
@@ -111,11 +114,21 @@ export class ActivityService {
       .addSelect(['actor.id', 'actor.email', 'actor.displayName', 'actor.code'])
       .leftJoin('a.subjectUser', 'subject')
       .addSelect(['subject.id', 'subject.email', 'subject.displayName', 'subject.code'])
-      .where('a.orgId = :orgId', { orgId })
       .orderBy('a.createdAt', 'DESC')
       .addOrderBy('a.id', 'DESC')
       .take(limit + 1);
 
+    if (viewAllOrgIds !== null) {
+      qb.where(
+        new Brackets((w) => {
+          w.where('a.actorId = :self', { self: userId }).orWhere('a.subjectUserId = :self');
+          if (viewAllOrgIds.length > 0) {
+            w.orWhere('a.orgId IN (:...viewAllOrgIds)', { viewAllOrgIds });
+          }
+        }),
+      );
+    }
+    if (orgId) qb.andWhere('a.orgId = :orgId', { orgId });
     if (filters.actions.length > 0) {
       qb.andWhere('a.action IN (:...actions)', { actions: filters.actions });
     }

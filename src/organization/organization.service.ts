@@ -332,6 +332,32 @@ export class OrganizationService {
   }
 
   /**
+   * The orgs in which a user holds `permissionName` (via their groups there), or
+   * `null` for a system admin — who holds every permission in every org. For
+   * cross-org reads that must still honor the per-org grant.
+   */
+  async getOrgIdsWithPermission(userId: string, permissionName: string): Promise<string[] | null> {
+    const user = await this.ensureUserExists(userId);
+    if (user.isAdmin) return null;
+
+    const userGroups = await this.userGroupRepo.find({
+      where: { userId },
+      relations: { group: true },
+    });
+    if (userGroups.length === 0) return [];
+
+    const grants = await this.groupPermRepo.find({
+      where: {
+        groupId: In(userGroups.map((ug) => ug.groupId)),
+        permission: { name: permissionName },
+      },
+      relations: { permission: true },
+    });
+    const orgByGroup = new Map(userGroups.map((ug) => [ug.groupId, ug.group.orgId]));
+    return [...new Set(grants.map((grant) => orgByGroup.get(grant.groupId)!))];
+  }
+
+  /**
    * Full access tree for a user, for the frontend to render UI after login:
    * the orgs they belong to → the groups they're in per org → the permissions
    * of each group, plus a flattened union of all permission names.

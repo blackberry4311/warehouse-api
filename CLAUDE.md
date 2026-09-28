@@ -704,14 +704,18 @@ the live code already logged). Backfilled top-ups/adjustments have a NULL actor 
 recorded who made them.
 
 **Read endpoint** (`ActivityModule`, `src/activity/`; `ActivityController`, prefix `activity`):
-`GET /activity?orgId=:orgId` (`view_activity_log`, an `organization`-category permission seeded by
-migration `0012`) — the org's feed, newest first, keyset-paginated (`limit`/`cursor`, same scheme as the
-other lists). Optional filters: `action` (comma-separated, unknown values dropped), `entityType` (400 if
-unknown) + `entityId` (one order/shipment/credit entry), `actorId` (who did it), `subjectUserId` (whose
-order/shipment/balance it was — backed by `activity_log_subject_created_idx`), `from` (inclusive) / `to`
-(exclusive). Each row joins `actor` / `subjectUser` (safe columns only). `ActivityService` re-checks
-org membership **and** that `view_activity_log` is held **in that org** (403 otherwise; admins pass),
-so a grant in one org can't read another's feed. Standalone module over `forFeature([ActivityLog])`,
+`GET /activity` (authenticated-only: `@UseGuards(JwtAccessGuard)`, not in `PERMISSION_API_MAP`) —
+the feed, newest first, keyset-paginated (`limit`/`cursor`, same scheme as the other lists). Scoping is
+applied in `ActivityService.listActivity`: **everyone** sees the rows they acted on or are the subject
+of (`actor_id_fk = me OR subject_user_id_fk = me`, in any org); a holder of **`view_all_activity_log`**
+(an `organization`-category group permission, migration `0015`, which also dropped the old
+`view_activity_log`) additionally sees **every** row in each org where they hold it
+(`OrganizationService.getOrgIdsWithPermission`) — a grant in one org never exposes another's feed;
+system admins see everything. Optional filters: `orgId` (narrow to one org; 404 if unknown), `action`
+(comma-separated, unknown values dropped), `entityType` (400 if unknown) + `entityId` (one
+order/shipment/credit entry), `actorId` (who did it), `subjectUserId` (whose order/shipment/balance it
+was — backed by `activity_log_subject_created_idx`), `from` (inclusive) / `to` (exclusive). Each row
+joins `actor` / `subjectUser` (safe columns only). Standalone module over `forFeature([ActivityLog])`,
 importing `OrganizationModule` for `OrganizationService`.
 
 ### Notifications (`NotificationModule`, `src/notification/`; `NotificationController`, prefix `notifications`)
