@@ -39,6 +39,7 @@ import { ExtraFeeModule } from './extra-fee/extra-fee.module';
 import { UserModule } from './user/user.module';
 import { ActivityModule } from './activity/activity.module';
 import { NotificationModule } from './notification/notification.module';
+import { ReportModule } from './report/report.module';
 import { StorageModule } from './storage/storage.module';
 import { ScheduleModule } from '@nestjs/schedule';
 import { EventEmitterModule } from '@nestjs/event-emitter';
@@ -97,6 +98,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
     UserModule,
     ActivityModule,
     NotificationModule,
+    ReportModule,
   ],
   exports: [TypeOrmModule],
   controllers: [AppController],

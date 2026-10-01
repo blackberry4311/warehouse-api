@@ -98,7 +98,7 @@ class-validator decorators and unknown properties are rejected.
   schema `wh`, `synchronize: false`) registering every entity in `src/entities/`, a
   `TypeOrmModule.forFeature([User, RefreshToken])`, and the feature modules `AuthModule`,
   `OrganizationModule`, `RbacModule`, `OrderModule`, `ShipmentModule`, `InventoryModule`,
-  `ExtraFeeModule`, `UserModule`, `ActivityModule`, and `NotificationModule`.
+  `ExtraFeeModule`, `UserModule`, `ActivityModule`, `NotificationModule`, and `ReportModule`.
 - `AuthModule` — registration/login/refresh/logout. Uses `@nestjs/jwt`, `bcrypt` for password
   hashing, and two Passport JWT strategies:
   - `jwt-access` (Bearer header) — guards ordinary endpoints via `JwtAccessGuard`.
@@ -189,7 +189,9 @@ class-validator decorators and unknown properties are rejected.
   below). Declared before `:orgId`.
 - Orgs: `POST /organizations`, `GET /organizations`, `GET /organizations/:orgId`.
 - Users: `POST /organizations/users` (requires `add_user`; auto-attaches to the caller's org).
-- Members: `POST|GET /organizations/:orgId/members`, `DELETE /organizations/:orgId/members/:userId`,
+- Members: `POST|GET /organizations/:orgId/members`, `DELETE /organizations/:orgId/members/:userId`
+  (also drops the user's `user_groups` rows in that org's groups, in the same transaction — they don't
+  cascade from `users_orgs`, and would otherwise keep granting the org's permissions),
   `GET /organizations/:orgId/members/:userId/permissions` (resolves effective permissions). The `GET`
   list returns each member's `user` as safe columns only (`id`, `email`, `displayName`, `code` — never
   `password_hash`), plus `credit` only when the caller holds `view_user_balances` / `manage_user_balances`.
@@ -717,6 +719,33 @@ order/shipment/credit entry), `actorId` (who did it), `subjectUserId` (whose ord
 was — backed by `activity_log_subject_created_idx`), `from` (inclusive) / `to` (exclusive). Each row
 joins `actor` / `subjectUser` (safe columns only). Standalone module over `forFeature([ActivityLog])`,
 importing `OrganizationModule` for `OrganizationService`.
+
+### Reports (`ReportModule`, `src/report/`; `ReportController`, prefix `reports`)
+Read-only dashboard aggregates over orders, shipments, inventory and the credit ledger. All routes are
+authenticated-only (`@UseGuards(JwtAccessGuard)`, not in `PERMISSION_API_MAP`); the scoping is applied
+in `ReportService.resolveScope`:
+- a holder of **`view_all_report`** (an `organization`-category group permission, migration `0016`) —
+  held in **any** org, it is a global grant — or a system admin reports over **every org and every
+  user**, optionally narrowed by `?orgId=` / `?userId=`;
+- everyone else reports only over **their own** rows (orders / shipments they placed, their own ledger)
+  in the orgs they belong to; `?orgId=` of an org they are not in, or `?userId=` of someone else, is a
+  403.
+
+Every response echoes the resolved `scope` (`{ viewAll, orgIds, userId }` — `orgIds: null` = all orgs).
+Shared filters: `orgId`, `userId`, `from` (inclusive) / `to` (exclusive) on `created_at`; the daily
+routes also take `tz` (IANA, default UTC) and return days newest first.
+- `GET /reports/overview` — orders by status, order lines by status (`count` + `qty`), shipments by
+  status (+ qty), current inventory (`lines`, `remaining` — **not** period-filtered), and the ledger
+  summary (`summarizeLedger`) plus `earnings` (warehouse earnings per **Credit / billing**; only on an
+  all-user `view_all_report` scope, else `null`).
+- `GET /reports/orders/daily` — orders placed per day, how many are now in each status, declared qty
+  (cancelled lines excluded) and received qty.
+- `GET /reports/shipments/daily` — shipments requested per day, per status, qty (cancelled excluded)
+  and `doneQty`.
+- `GET /reports/credit/daily` — the scoped ledger per day (`summarizeLedgerByDay`);
+  `closingBalance` only on a single-user scope.
+- `GET /reports/top-clients` — users ranked by `metric` = `orders` (default) | `shipments` (both
+  excluding cancelled) | `spent` (net charges), `limit` default 10 / max 50.
 
 ### Notifications (`NotificationModule`, `src/notification/`; `NotificationController`, prefix `notifications`)
 In-app only (no email/push yet), single-instance. Fanned out from `activity_log`:

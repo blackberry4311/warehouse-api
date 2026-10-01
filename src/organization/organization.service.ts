@@ -168,9 +168,19 @@ export class OrganizationService {
   }
 
   async removeMember(orgId: string, userId: string) {
-    const result = await this.userOrgRepo.delete({ orgId, userId });
-    if (!result.affected) throw new NotFoundException('Membership not found');
-    return { removed: true };
+    // Group assignments are keyed by group, not org, so they don't cascade from the
+    // membership row — drop the user's groups in this org with it, or they would keep
+    // granting the org's permissions after leaving.
+    const orgGroups = await this.groupRepo.find({ where: { orgId }, select: { id: true } });
+
+    return this.userOrgRepo.manager.transaction(async (em) => {
+      const result = await em.delete(UserOrg, { orgId, userId });
+      if (!result.affected) throw new NotFoundException('Membership not found');
+      if (orgGroups.length > 0) {
+        await em.delete(UserGroup, { userId, groupId: In(orgGroups.map((g) => g.id)) });
+      }
+      return { removed: true };
+    });
   }
 
   // --- Groups (roles) ------------------------------------------------------
