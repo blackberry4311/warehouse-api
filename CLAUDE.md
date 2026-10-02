@@ -211,7 +211,9 @@ class-validator decorators and unknown properties are rejected.
   `{ url, expiresIn, contentType }` so the FE loads the image straight from the bucket, never proxying
   bytes through the API (`?download=true` forces a save dialog); the URL is valid for
   `BILL_URL_TTL_SECONDS` (7 days). See **Credit / billing** → **Top-up bills**.
-- Fees (system-admin only): `POST|GET /organizations/:orgId/fees` — set / list an org's flat fees.
+- Fees: `POST /organizations/:orgId/fees` (system-admin only) sets an org's per-unit lock fee. There is
+  no separate read — `GET /organizations` returns each org with its `fees` rows embedded, so anyone with
+  `view_organizations` sees them.
 - Credit groups (system-admin only): `POST|GET /organizations/:orgId/credit-groups`,
   `GET|DELETE /organizations/:orgId/credit-groups/:creditGroupId`,
   `POST|GET /organizations/:orgId/credit-groups/:creditGroupId/fees` (set/list the group's per-`fee_type`
@@ -434,7 +436,8 @@ client may act (cancel an `AWAITING` shipment); once **locked** only operations 
 `CANCELLED`). Locking does **not** change `status` (it stays `AWAITING`), exactly like orders.
 
 **Lock is the billing + stock-deduction event** (`ShipmentService.lockShipment`, one transaction):
-- the shipment's **client** (`shipment.userId`) is charged the org's flat `SHIPMENT_LOCK` fee — same
+- the shipment's **client** (`shipment.userId`) is charged the org's `SHIPMENT_LOCK` rate × the shipment's
+  total line qty — same
   `FOR UPDATE`/insufficient-credit/`fee 0 = no charge` mechanics as the order-lock charge, writing a
   `SHIPMENT_LOCK` `credit_history` row linked via the new `credit_history.shipment_id_fk`;
 - each line's `qty` is added to the order line item's `order_details.shipped_qty` (each `order_details`
@@ -502,7 +505,7 @@ their inventory, then references a line's `detailId` (as `orderDetailId`) in a s
 Every fee charged against a single order or shipment lives in **one** table (`wh.total_fees`,
 `TotalFee` entity), of two kinds distinguished by `is_protected`:
 - the **lock fee** (`is_protected = true`) — written automatically when the order/shipment is locked,
-  for the org's flat `ORDER_LOCK` / `SHIPMENT_LOCK` amount (see **Credit / billing**). Exactly one per
+  for the org's `ORDER_LOCK` / `SHIPMENT_LOCK` rate × the target's total qty (see **Credit / billing**). Exactly one per
   target, and it **cannot be voided**.
 - ad-hoc, **named** extra fees (`is_protected = false`) operations staff add (e.g. "Repackaging",
   "Storage overage"). These **can** be voided.
@@ -543,12 +546,15 @@ endpoint); there is no separate module.
 
 - **The wallet.** `users.credit` is a single `numeric` balance per user, shared across all orgs (not
   per-org). Exposed as a JS number via `numericTransformer`. New users start at 0.
-- **Per-org fees.** `wh.org_fees` holds a flat `amount` per `(org_id_fk, fee_type)`; `fee_type` is
+- **Per-org fees.** `wh.org_fees` holds a **per-unit** `amount` per `(org_id_fk, fee_type)` — on lock
+  the client is charged `amount × qty`, where qty is the order's total line qty (cancelled lines
+  excluded) or the shipment's total line qty; `fee_type` is
   `ORDER_LOCK` (charged on order lock) or `SHIPMENT_LOCK` (charged on shipment lock). An org with
-  **no row** for a fee_type is treated as fee **0** (not charged). Fees are billing config: set/listed
-  only by a **system admin** (`is_admin`) via `POST|GET /organizations/:orgId/fees` (`SetOrgFeeDto`:
-  `feeType`, `amount ≥ 0`). These routes are **not** in `PERMISSION_API_MAP` — they use
-  `@UseGuards(JwtAccessGuard)` and `OrganizationService.setOrgFee`/`listOrgFees` enforce `is_admin`.
+  **no row** for a fee_type is treated as fee **0** (not charged). Fees are billing config: set
+  only by a **system admin** (`is_admin`) via `POST /organizations/:orgId/fees` (`SetOrgFeeDto`:
+  `feeType`, `amount ≥ 0`). That route is **not** in `PERMISSION_API_MAP` — it uses
+  `@UseGuards(JwtAccessGuard)` and `OrganizationService.setOrgFee` enforces `is_admin`. Reads are not
+  admin-gated: `GET /organizations` embeds each org's `fees` rows (`listOrganizations`).
 - **The charge (order lock).** `OrderService.lockOrder` resolves the org's `ORDER_LOCK` fee and, in the
   **same transaction** as the lock + `LOCKED` history row, always writes a **protected** `total_fees`
   row (`is_protected = true`, name "Order lock fee", the fee amount — even when 0), then charges the
@@ -556,7 +562,7 @@ endpoint); there is no separate module.
   row (so concurrent charges/top-ups can't overdraw), throws `400` if `credit < fee`, deducts, and
   writes an `ORDER_LOCK` ledger row linked to the fee row via `fee_id_fk`. A fee of 0 charges nothing
   and writes no ledger row, but the protected `total_fees` row (amount 0) is still recorded. The amount
-  charged is the org fee **unless the client is in a credit group** that overrides it — see **Credit
+  charged is the org rate × qty **unless the client is in a credit group** whose rate overrides it — see **Credit
   groups** below (the charged amount, and any owner commission, are resolved by
   `resolveClientFee`/`creditCommission` in `src/common/credit-group.util.ts`).
 - **The charge (shipment lock).** `ShipmentService.lockShipment` charges the shipment's **client** the

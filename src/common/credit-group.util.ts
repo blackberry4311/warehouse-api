@@ -14,48 +14,70 @@ import {
 import { recordActivity } from './activity-log.util';
 
 /**
- * The resolved lock-fee split for a client, given the org's flat fee (`base`):
- *  - `charged` — what the client actually pays. Equals the client's credit-group fee
- *    when they belong to a credit group with one configured for this `feeType`
- *    (floored at `base` so the markup is never negative); otherwise `base`.
+ * The resolved lock-fee split for a client. Fees are **per-unit rates**: the org's
+ * flat fee (`baseRate`) and any credit-group fee are multiplied by the qty being
+ * locked (the order's line qty / the shipment's line qty).
+ *  - `unitFee` — the per-unit rate the client pays. Equals the client's credit-group
+ *    fee when they belong to a credit group with one configured for this `feeType`
+ *    (floored at `baseRate` so the markup is never negative); otherwise `baseRate`.
+ *  - `charged` — what the client actually pays: `unitFee × qty`.
+ *  - `baseCharged` — the warehouse's cut: `baseRate × qty`. The owner's markup is
+ *    `charged − baseCharged`.
  *  - `ownerId` — the credit group's owner, credited the markup; null when there is no
  *    override (client is in no credit group, or the group has no fee for this type).
  */
 export interface ResolvedClientFee {
+  unitFee: number;
   charged: number;
+  baseCharged: number;
   ownerId: string | null;
 }
 
+/** `rate × qty`, rounded to cents so float error never reaches the `numeric` columns. */
+function scaleFee(rate: number, qty: number): number {
+  return Math.round(rate * qty * 100) / 100;
+}
+
 /**
- * Resolve the amount a client is charged when their order/shipment is locked. A
- * client's single credit group (per org) may override the org's flat `base` fee with
- * a marked-up amount; the group's owner then earns the difference (see
- * {@link creditCommission}). Runs inside the lock transaction on the given manager.
+ * Resolve the amount a client is charged when their order/shipment is locked: the
+ * per-unit rate times `qty`. A client's single credit group (per org) may override
+ * the org's flat `baseRate` with a marked-up rate; the group's owner then earns the
+ * difference (see {@link creditCommission}). Runs inside the lock transaction on the
+ * given manager.
  */
 export async function resolveClientFee(
   em: EntityManager,
   orgId: string,
   clientUserId: string,
   feeType: FeeType,
-  base: number,
+  baseRate: number,
+  qty: number,
 ): Promise<ResolvedClientFee> {
+  const baseCharged = scaleFee(baseRate, qty);
+  const plain: ResolvedClientFee = {
+    unitFee: baseRate,
+    charged: baseCharged,
+    baseCharged,
+    ownerId: null,
+  };
+
   const membership = await em.findOne(CreditGroupMember, {
     where: { userId: clientUserId, orgId },
   });
-  if (!membership) return { charged: base, ownerId: null };
+  if (!membership) return plain;
 
   const groupFee = await em.findOne(CreditGroupFee, {
     where: { creditGroupId: membership.creditGroupId, feeType },
   });
-  if (!groupFee) return { charged: base, ownerId: null };
+  if (!groupFee) return plain;
 
   const group = await em.findOne(CreditGroup, { where: { id: membership.creditGroupId } });
-  if (!group) return { charged: base, ownerId: null };
+  if (!group) return plain;
 
   // Floor at the org base so the owner's markup can never be negative, even if the
   // group fee was somehow set below the current org fee.
-  const charged = Math.max(groupFee.amount, base);
-  return { charged, ownerId: group.ownerId };
+  const unitFee = Math.max(groupFee.amount, baseRate);
+  return { unitFee, charged: scaleFee(unitFee, qty), baseCharged, ownerId: group.ownerId };
 }
 
 /**

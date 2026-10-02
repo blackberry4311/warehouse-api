@@ -1,7 +1,7 @@
 import { IsEnum, IsNumber, Min } from 'class-validator';
 import { FeeType } from '../../entities/org-fee.entity';
 
-/** Upsert an organization's flat fee for an action (system-admin only). */
+/** Upsert an organization's per-unit fee for an action (system-admin only); charged × qty on lock. */
 export class SetOrgFeeDto {
   @IsEnum(FeeType)
   feeType: FeeType;

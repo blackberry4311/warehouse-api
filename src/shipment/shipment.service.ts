@@ -567,9 +567,10 @@ export class ShipmentService {
    * A reviewer (`review_shipment`) reviews and locks an AWAITING shipment, handing
    * it to operations. Locking is the billing + fulfilment event, all in one
    * transaction:
-   *   - the shipment's **client** (`shipment.userId`) is charged the org's flat
-   *     `SHIPMENT_LOCK` fee (row locked FOR UPDATE; rejected if credit can't
-   *     cover it; an org with no fee configured is charged nothing);
+   *   - the shipment's **client** (`shipment.userId`) is charged the org's
+   *     `SHIPMENT_LOCK` fee **per unit** — the rate times the shipment's total line
+   *     qty (row locked FOR UPDATE; rejected if credit can't cover it; an org with no
+   *     fee configured is charged nothing);
    *   - each line's qty is added to the order line item's `shipped_qty` (each
    *     `order_details` row locked FOR UPDATE and re-checked so concurrent locks can't
    *     over-ship); the order header is never touched;
@@ -586,19 +587,24 @@ export class ShipmentService {
     }
 
     await this.shipmentRepo.manager.transaction(async (em) => {
-      // 1. Charge the client the org's SHIPMENT_LOCK fee (0 if none configured).
+      const items = await em.find(ShipmentDetail, { where: { shipmentId: shipment.id } });
+      const qty = items.reduce((sum, i) => sum + i.qty, 0);
+
+      // 1. Charge the client the org's per-unit SHIPMENT_LOCK fee × the shipment's
+      //    total qty (0 if none configured).
       const feeRow = await em.findOne(OrgFee, {
         where: { orgId: shipment.orgId, feeType: FeeType.SHIPMENT_LOCK },
       });
-      // The org's flat fee is the warehouse's base cut. A credit group the client
+      // The org's rate is the warehouse's base cut. A credit group the client
       // belongs to overrides it as what the client pays; the owner earns the markup.
-      const base = feeRow?.amount ?? 0;
-      const { charged, ownerId } = await resolveClientFee(
+      const baseRate = feeRow?.amount ?? 0;
+      const { unitFee, charged, baseCharged, ownerId } = await resolveClientFee(
         em,
         shipment.orgId,
         shipment.userId,
         FeeType.SHIPMENT_LOCK,
-        base,
+        baseRate,
+        qty,
       );
 
       // Always record the lock fee as a protected (non-voidable) row, so it shows up
@@ -649,9 +655,9 @@ export class ShipmentService {
         );
       }
 
-      // Credit the credit group's owner the markup (group fee − org fee); the
-      // warehouse keeps only the org base.
-      const markup = charged - base;
+      // Credit the credit group's owner the markup ((group rate − org rate) × qty);
+      // the warehouse keeps only the org base.
+      const markup = Math.round((charged - baseCharged) * 100) / 100;
       if (ownerId && markup > 0) {
         await creditCommission(em, {
           ownerId,
@@ -668,7 +674,6 @@ export class ShipmentService {
       // 2. Deduct each line's qty from the order line item it draws from. Each
       //    order_details row is locked FOR UPDATE and re-checked so two concurrent
       //    locks can't over-ship the same inventory. The order header is never touched.
-      const items = await em.find(ShipmentDetail, { where: { shipmentId: shipment.id } });
       for (const item of items) {
         const detail = await em
           .createQueryBuilder(OrderDetail, 'd')
@@ -712,7 +717,7 @@ export class ShipmentService {
         shipment,
         userId,
         ActivityAction.SHIPMENT_LOCKED,
-        { fee: charged, ...(balance ?? {}) },
+        { fee: charged, unitFee, qty, ...(balance ?? {}) },
         dto.note ?? null,
       );
     });

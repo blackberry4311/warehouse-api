@@ -112,15 +112,6 @@ export class OrganizationController {
     return this.orgService.setOrgFee(actor.userId, orgId, dto);
   }
 
-  @Get(':orgId/fees')
-  @UseGuards(JwtAccessGuard)
-  listOrgFees(
-    @CurrentUser() actor: AuthenticatedUser,
-    @Param('orgId', ParseUUIDPipe) orgId: string,
-  ) {
-    return this.orgService.listOrgFees(actor.userId, orgId);
-  }
-
   // --- Credit groups (system-admin only) -----------------------------------
   // Billing construct: a set of clients whose lock fee is marked up, with an owner
   // who earns (group fee − org fee). Not in PERMISSION_API_MAP; the service enforces

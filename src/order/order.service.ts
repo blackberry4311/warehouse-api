@@ -676,7 +676,8 @@ export class OrderService {
    * LOCKED history row. Only a still-in-transit, not-yet-locked order can be locked.
    *
    * Locking is also the billing event: the order's **client** (`order.userId`, not
-   * the acting reviewer) is charged the org's flat `ORDER_LOCK` fee. The charge, the
+   * the acting reviewer) is charged the org's `ORDER_LOCK` fee **per unit** — the rate
+   * times the order's total line qty (cancelled lines excluded). The charge, the
    * lock, and both audit rows all happen in one transaction, and the client's row is
    * locked `FOR UPDATE` so concurrent charges can't overdraw. If the client's credit
    * can't cover the fee the whole lock is rejected. An org with no configured fee
@@ -699,16 +700,23 @@ export class OrderService {
       const feeRow = await em.findOne(OrgFee, {
         where: { orgId: order.orgId, feeType: FeeType.ORDER_LOCK },
       });
-      // The org's flat fee is the warehouse's base cut. If the client is in a credit
-      // group, its fee overrides this as what the client pays; the group's owner earns
+      // The fee is a per-unit rate, charged on the order's total line qty (cancelled
+      // lines excluded), read inside the transaction.
+      const lines = await em.find(OrderDetail, { where: { orderId: order.id } });
+      const qty = lines
+        .filter((d) => d.status !== OrderDetailStatus.CANCELLED)
+        .reduce((sum, d) => sum + d.qty, 0);
+      // The org's rate is the warehouse's base cut. If the client is in a credit
+      // group, its rate overrides this as what the client pays; the group's owner earns
       // the difference (see resolveClientFee / creditCommission).
-      const base = feeRow?.amount ?? 0;
-      const { charged, ownerId } = await resolveClientFee(
+      const baseRate = feeRow?.amount ?? 0;
+      const { unitFee, charged, baseCharged, ownerId } = await resolveClientFee(
         em,
         order.orgId,
         order.userId,
         FeeType.ORDER_LOCK,
-        base,
+        baseRate,
+        qty,
       );
 
       // Always record the lock fee as a protected (non-voidable) row, so it shows up
@@ -761,9 +769,9 @@ export class OrderService {
         );
       }
 
-      // Credit the credit group's owner the markup they earned (group fee − org fee);
-      // the warehouse keeps only the org base.
-      const markup = charged - base;
+      // Credit the credit group's owner the markup they earned ((group rate − org
+      // rate) × qty); the warehouse keeps only the org base.
+      const markup = Math.round((charged - baseCharged) * 100) / 100;
       if (ownerId && markup > 0) {
         await creditCommission(em, {
           ownerId,
@@ -796,7 +804,7 @@ export class OrderService {
         order,
         userId,
         ActivityAction.ORDER_LOCKED,
-        { fee: charged, ...(balance ?? {}) },
+        { fee: charged, unitFee, qty, ...(balance ?? {}) },
         dto.note ?? null,
       );
 

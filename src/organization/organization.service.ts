@@ -81,8 +81,18 @@ export class OrganizationService {
     return this.orgRepo.save(org);
   }
 
-  listOrganizations() {
-    return this.orgRepo.find({ order: { createdAt: 'DESC' } });
+  async listOrganizations() {
+    const [orgs, fees] = await Promise.all([
+      this.orgRepo.find({ order: { createdAt: 'DESC' } }),
+      this.orgFeeRepo.find(),
+    ]);
+    const feesByOrg = new Map<string, OrgFee[]>();
+    for (const fee of fees) {
+      const list = feesByOrg.get(fee.orgId) ?? [];
+      list.push(fee);
+      feesByOrg.set(fee.orgId, list);
+    }
+    return orgs.map((org) => ({ ...org, fees: feesByOrg.get(org.id) ?? [] }));
   }
 
   async getOrganization(orgId: string) {
@@ -494,8 +504,8 @@ export class OrganizationService {
   // --- Org fees (system-admin only) ---------------------------------------
 
   /**
-   * Upsert an org's flat fee for an action (e.g. the `ORDER_LOCK` fee charged when
-   * a reviewer locks an order). System-admin only — this is billing config, not an
+   * Upsert an org's per-unit fee for an action (e.g. the `ORDER_LOCK` rate, charged
+   * × the order's total line qty when a reviewer locks an order). System-admin only — this is billing config, not an
    * org-scoped, permission-gated operation. Returns the stored fee row.
    */
   async setOrgFee(actingUserId: string, orgId: string, dto: SetOrgFeeDto) {
@@ -508,14 +518,6 @@ export class OrganizationService {
       'feeType',
     ]);
     return this.orgFeeRepo.findOne({ where: { orgId, feeType: dto.feeType } });
-  }
-
-  /** List an org's configured fees. System-admin only (billing config). */
-  async listOrgFees(actingUserId: string, orgId: string) {
-    const actor = await this.ensureUserExists(actingUserId);
-    if (!actor.isAdmin) throw new ForbiddenException('Only a system admin can view fees');
-    await this.getOrganization(orgId);
-    return this.orgFeeRepo.find({ where: { orgId } });
   }
 
   // --- Credit groups (system-admin only) -----------------------------------
